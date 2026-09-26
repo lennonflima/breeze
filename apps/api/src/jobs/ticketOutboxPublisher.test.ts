@@ -195,10 +195,34 @@ describe('ticketOutboxPublisher.publishOutboxRows', () => {
     expect(payloadArg).toEqual({ ticketId: 'ticket-1', from: 'open', to: 'resolved' });
   });
 
-  it('drains an unmapped event type (ticket.updated) — marks published WITHOUT calling publishEvent', async () => {
+  it('publishes ticket.updated (field names only) and ticket.assigned (assignee id) onto the bus', async () => {
     executeMock.mockResolvedValueOnce({ rows: [] });
     executeMock.mockResolvedValueOnce({
-      rows: [claimedRow({ id: 4, event_type: 'ticket.updated', payload: {} })],
+      rows: [
+        claimedRow({ id: 4, event_type: 'ticket.updated', payload: { changed: ['subject', 'priority'] } }),
+        claimedRow({ id: 5, event_type: 'ticket.assigned', payload: { assigneeId: 'u-1' } }),
+      ],
+    });
+    const chain = makeUpdateChain();
+    updateMock.mockReturnValue({ set: chain.set });
+
+    const result = await publishOutboxRows();
+
+    expect(result).toEqual({ published: 2, skipped: 0 });
+    expect(publishEventMock).toHaveBeenCalledTimes(2);
+    expect(publishEventMock).toHaveBeenCalledWith(
+      'ticket.updated', 'org-1', { ticketId: 'ticket-1', changed: ['subject', 'priority'] }, 'ticket-outbox-publisher',
+    );
+    expect(publishEventMock).toHaveBeenCalledWith(
+      'ticket.assigned', 'org-1', { ticketId: 'ticket-1', assigneeId: 'u-1' }, 'ticket-outbox-publisher',
+    );
+    expect(updateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('drains the unmapped ticket.restored — marks published WITHOUT calling publishEvent', async () => {
+    executeMock.mockResolvedValueOnce({ rows: [] });
+    executeMock.mockResolvedValueOnce({
+      rows: [claimedRow({ id: 6, event_type: 'ticket.restored', payload: {} })],
     });
     const chain = makeUpdateChain();
     updateMock.mockReturnValue({ set: chain.set });
@@ -209,22 +233,6 @@ describe('ticketOutboxPublisher.publishOutboxRows', () => {
     expect(publishEventMock).not.toHaveBeenCalled();
     // Still drained: the row is marked published even with no bus target.
     expect(updateMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('drains ticket.assigned and ticket.restored the same unmapped way', async () => {
-    executeMock.mockResolvedValueOnce({ rows: [] });
-    executeMock.mockResolvedValueOnce({
-      rows: [
-        claimedRow({ id: 5, event_type: 'ticket.assigned', payload: { assigneeId: 'u-1' } }),
-        claimedRow({ id: 6, event_type: 'ticket.restored', payload: {} }),
-      ],
-    });
-    updateMock.mockReturnValue({ set: makeUpdateChain().set });
-
-    const result = await publishOutboxRows();
-
-    expect(result).toEqual({ published: 2, skipped: 0 });
-    expect(publishEventMock).not.toHaveBeenCalled();
   });
 
   it('skips rows with publish_attempts > 5: logs, captures, does not publish', async () => {

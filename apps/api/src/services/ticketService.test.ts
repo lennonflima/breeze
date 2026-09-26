@@ -372,7 +372,7 @@ describe('createTicket', () => {
     const outboxPayload = valuesMock.mock.calls[1]![0];
     expect(outboxPayload).toMatchObject({ orgId: 'o-1', ticketId: 't-1', eventType: 'ticket.created' });
     // id-only: no subject/description ever reaches the outbox payload.
-    expect(outboxPayload.payload).toEqual({});
+    expect(outboxPayload.payload).toEqual({ internalNumber: 'T-2026-0042', source: 'manual', assigneeId: null });
     expect(JSON.stringify(outboxPayload)).not.toContain('SECRET');
   });
 
@@ -1094,7 +1094,7 @@ describe('changeTicketStatus', () => {
     expect(valuesMock).toHaveBeenCalledTimes(2);
     const outboxPayload = valuesMock.mock.calls[1]![0];
     expect(outboxPayload).toMatchObject({ orgId: 'o-1', ticketId: 't-1', eventType: 'ticket.status_changed' });
-    expect(outboxPayload.payload).toEqual({ from: 'open', to: 'resolved' });
+    expect(outboxPayload.payload).toEqual({ from: 'open', to: 'resolved', statusId: null });
     expect(JSON.stringify(outboxPayload)).not.toContain('SECRET');
   });
 
@@ -1818,7 +1818,7 @@ describe('addTicketComment', () => {
     expect(valuesMock).toHaveBeenCalledTimes(2);
     const outboxPayload = valuesMock.mock.calls[1]![0];
     expect(outboxPayload).toMatchObject({ orgId: 'o-1', ticketId: 't-1', eventType: 'ticket.commented' });
-    expect(outboxPayload.payload).toEqual({ commentId: 'c-1', isPublic: true });
+    expect(outboxPayload.payload).toEqual({ commentId: 'c-1', isPublic: true, originPrincipalKind: 'user', originPrincipalId: null });
     expect(JSON.stringify(outboxPayload)).not.toContain('SECRET');
   });
 
@@ -2226,7 +2226,9 @@ describe('updateTicketFields', () => {
       ticketId: 't-1',
       eventType: 'ticket.updated'
     });
-    expect(outboxPayload.payload).toEqual({});
+    // Field NAMES only — never the new values.
+    expect(outboxPayload.payload).toEqual({ changed: ['subject', 'priority'] });
+    expect(JSON.stringify(outboxPayload)).not.toContain('New subject');
 
     expect(emitMock).toHaveBeenCalledWith(expect.objectContaining({
       type: 'ticket.updated',
@@ -4641,6 +4643,8 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
     expect(outboxPayload('ticket.commented')).toEqual({
       commentId: 'c-1',
       isPublic: true,
+      originPrincipalKind: 'user',
+      originPrincipalId: null,
       aiDraft: { draftId: 'draft-1', runId: 'run-1', trigger: 'draft_sent' },
     });
   });
@@ -4652,7 +4656,7 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
 
     await sendTicketDraft('t-1', 'draft-1', undefined, actor);
 
-    expect(outboxPayload('ticket.commented')).toEqual({ commentId: 'c-1', isPublic: true });
+    expect(outboxPayload('ticket.commented')).toEqual({ commentId: 'c-1', isPublic: true, originPrincipalKind: 'user', originPrincipalId: null });
   });
 
   it('resolving with an aiDraftId writes the resolved_with_ai_note claim into the ticket.status_changed outbox payload', async () => {
@@ -4669,6 +4673,7 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
     expect(outboxPayload('ticket.status_changed')).toEqual({
       from: 'open',
       to: 'resolved',
+      statusId: null,
       aiDraft: { draftId: 'draft-1', runId: 'run-9', trigger: 'resolved_with_ai_note' },
     });
   });
@@ -4680,7 +4685,7 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
 
     await changeTicketStatus('t-1', { status: 'resolved' }, { resolutionNote: 'Replaced toner' }, actor);
 
-    expect(outboxPayload('ticket.status_changed')).toEqual({ from: 'open', to: 'resolved' });
+    expect(outboxPayload('ticket.status_changed')).toEqual({ from: 'open', to: 'resolved', statusId: null });
   });
 
   it('ticketService never imports the action-intent graph (worker closure contract)', async () => {
