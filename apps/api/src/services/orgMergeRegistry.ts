@@ -988,6 +988,7 @@ const REPOINT_TABLES: readonly string[] = [
   "organization_external_links",
   "organization_key_dates",
   "pam_rules",
+  "partner_api_idempotency_keys",
   "partner_enrollment_key_idempotency",
   "patch_compliance_reports",
   "patch_compliance_snapshots",

@@ -9,6 +9,7 @@ import { partnerProvisioningRoutes } from './provisioning';
 import { partnerContractRoutes } from './contracts';
 import { partnerAlertRoutes } from './alerts';
 import { partnerTicketRoutes } from './tickets';
+import { partnerTicketWriteRoutes } from './ticketWrites';
 import { partnerExportAuditMiddleware } from './audit';
 
 export const partnerApiRoutes = new Hono();
@@ -31,3 +32,7 @@ partnerApiRoutes.route('/', partnerContractRoutes);
 // alerts:read (opt-in scope). Read-only latest-state feed; see alerts.ts.
 partnerApiRoutes.route('/', partnerAlertRoutes);
 partnerApiRoutes.route('/', partnerTicketRoutes);
+// tickets:write (opt-in). Create/update/status/assign/comment through
+// ticketService; the principal acts as itself. Non-GET routes must ALSO be
+// listed in writeSurface.test.ts.
+partnerApiRoutes.route('/', partnerTicketWriteRoutes);
