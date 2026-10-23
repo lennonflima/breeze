@@ -34,9 +34,10 @@
 --     only the reattaches that touch their orgs (§4.4).
 --
 -- Indexes: source_device_id serves the "never target a retired source" check
--- (§6.5); confirmation_token_hash serves confirm replay after the intent is
--- pruned (unique: one ledger row per confirmation token); intent_id is unique
--- (one ledger row per intent).
+-- (§6.5); source_agent_id serves confirm replay after the intent is pruned
+-- (the route's `:id`; the token hash is then compared in constant time);
+-- confirmation_token_hash and intent_id are unique (one ledger row per
+-- confirmation token and per intent).
 --
 -- Idempotent. No inner BEGIN/COMMIT. Writes no rows.
 
@@ -77,6 +78,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS device_reattachments_intent_uq
   ON public.device_reattachments (intent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS device_reattachments_confirmation_hash_uq
   ON public.device_reattachments (confirmation_token_hash);
+CREATE INDEX IF NOT EXISTS device_reattachments_source_agent_idx
+  ON public.device_reattachments (source_agent_id);
 CREATE INDEX IF NOT EXISTS device_reattachments_source_device_idx
   ON public.device_reattachments (source_device_id);
 CREATE INDEX IF NOT EXISTS device_reattachments_target_device_idx

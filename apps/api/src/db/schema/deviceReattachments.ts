@@ -40,6 +40,7 @@ export const deviceReattachments = pgTable('device_reattachments', {
 }, (table) => [
   uniqueIndex('device_reattachments_intent_uq').on(table.intentId),
   uniqueIndex('device_reattachments_confirmation_hash_uq').on(table.confirmationTokenHash),
+  index('device_reattachments_source_agent_idx').on(table.sourceAgentId),
   index('device_reattachments_source_device_idx').on(table.sourceDeviceId),
   index('device_reattachments_target_device_idx').on(table.targetDeviceId),
   index('device_reattachments_partner_confirmed_idx').on(table.partnerId, table.confirmedAt),

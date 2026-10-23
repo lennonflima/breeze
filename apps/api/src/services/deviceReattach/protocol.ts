@@ -49,8 +49,7 @@ export type ReattachCancelReason =
   | 'requester_revoked'
   | 'restage_refused'
   | 'key_revoked'
-  | 'source_ineligible'
-  | 'target_ineligible';
+  | 'device_limit_reached';
 
 /** A SHA-256 hex digest, as every hash on the wire and in the intent is. */
 export const SHA256_HEX = /^[0-9a-f]{64}$/;

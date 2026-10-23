@@ -140,10 +140,10 @@ CREATE INDEX IF NOT EXISTS device_reattach_intents_partner_idx
   ON public.device_reattach_intents (partner_id);
 CREATE INDEX IF NOT EXISTS device_reattach_intents_requested_by_idx
   ON public.device_reattach_intents (requested_by);
--- rebind-confirm authenticates by this hash (§6.4).
-CREATE INDEX IF NOT EXISTS device_reattach_intents_confirmation_hash_idx
-  ON public.device_reattach_intents (confirmation_token_hash)
-  WHERE confirmation_token_hash IS NOT NULL;
+-- rebind-confirm finds the caller's intents by the route's `:id` (the
+-- source agent id), then compares the token hash in constant time (§6.4).
+CREATE INDEX IF NOT EXISTS device_reattach_intents_source_agent_idx
+  ON public.device_reattach_intents (source_agent_id);
 -- The expiry sweep (open intents past expires_at) and the 30-day prune.
 CREATE INDEX IF NOT EXISTS device_reattach_intents_open_expiry_idx
   ON public.device_reattach_intents (expires_at)
