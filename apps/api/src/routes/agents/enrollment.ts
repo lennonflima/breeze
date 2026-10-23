@@ -22,6 +22,7 @@ import { getRedis } from '../../services/redis';
 import { rateLimiter } from '../../services/rate-limit';
 import { invalidateOrgDeviceCount } from '../../services/agentOrgRateLimit';
 import { enrollSchema } from './schemas';
+import { normalizeRebindProtocolVersion } from '../../services/deviceReattach/protocol';
 import { generateAgentId, generateApiKey, issueMtlsCertForDevice } from './helpers';
 import { buildEnrollmentResponseBody } from './enrollmentResponse';
 import { recordAgentEnrollment } from '../../services/anomalyMetrics';
@@ -885,6 +886,9 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
             backupReadProtocolVersion: null,
             backupIntegrityProtocolVersion: null,
             backupWriteProtocolVersion: null,
+            // #8318 §6.2: re-enroll is a new install, so its declared rebind
+            // capability is rewritten (not blindly reset to 0).
+            rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
             status: 'pending',
             updatedAt: new Date(),
           })
@@ -937,6 +941,8 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
             deviceRoleSource: 'auto',
             isVirtual: data.isVirtual ?? false,
             virtualizationPlatform: data.virtualizationPlatform ?? null,
+            // #8318 §6.2: a new install is what a reattach makes the source.
+            rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
             status: 'pending',
             isEphemeral: isSupportEnrollment,
             // #2764: forensic + UI linkage back to the row this enrollment may
