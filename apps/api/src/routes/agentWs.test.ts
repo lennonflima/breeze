@@ -7037,6 +7037,33 @@ describe('late terminal_start failure binds to the exact terminal generation', (
     expect(isAgentConnected('agent-term-rollout')).toBe(true);
   });
 
+  // #8318 §6.4 (review of wave 1b-1): a superseded install's socket whose
+  // suspension write finds the row in another install's hands suspends
+  // nothing, so no `agent.token.suspended` row is attributed to the device.
+  it('writes no suspension audit when the suspending write finds the row in another install\'s hands', async () => {
+    const sessionId = '10000000-0000-4000-8000-000000000005';
+    const owner = await openAgentSocket('agent-term-owner-2', TERM_DEVICE_ID);
+    const foreign = await openAgentSocket('agent-term-superseded', 'device-term-superseded');
+
+    const gen = await openTerminalGeneration(sessionId, 'agent-term-owner-2', owner.ws);
+    // The suspension write matches 0 rows, and the one re-read shows another agent_id.
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }) }),
+    } as any);
+    vi.mocked(db.select).mockReturnValue(selectAgentDevice([{ agentId: 'agent-after-reattach' }]) as any);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    for (let i = 0; i < 5; i += 1) {
+      await foreign.handlers.onMessage(failedStartResult(gen.startCommandId), foreign.ws as any);
+    }
+    await new Promise((r) => setImmediate(r));
+
+    expect(suspendAudits()).toHaveLength(0);
+    expect(warnSpy.mock.calls.some((call) =>
+      typeof call[0] === 'string' && call[0].includes('cross-tenant probe from a superseded install'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
   it('counts a LIVE start failure claimed by a different agent as a cross-tenant probe', async () => {
     const sessionId = '10000000-0000-4000-8000-000000000004';
     const owner = await openAgentSocket('agent-term-owner', TERM_DEVICE_ID);
@@ -7611,7 +7638,7 @@ describe('update_status write coalescing', () => {
 
   const preValidatedAgent = { deviceId: 'device-upd', agentId: 'agent-test', siteId: 'site-test', installIncarnation: 1, orgId: 'org-123', partnerId: 'partner-123' };
 
-  function rigUpdate(whereImpl: () => Promise<unknown> = async () => []) {
+  function rigUpdate(whereImpl: () => Promise<unknown> = async () => [{ id: 'device-upd' }]) {
     // updateOwnDeviceRow (#8318 §6.4) resolves the write at `.returning()`;
     // `whereImpl` still decides whether it resolves or rejects.
     const whereMock = vi.fn(() => ({ returning: vi.fn(whereImpl) }));
@@ -7628,7 +7655,7 @@ describe('update_status write coalescing', () => {
   it('a concurrent burst of identical frames performs a single devices write', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const { setMock } = rigUpdate(async () => { await gate; return []; });
+    const { setMock } = rigUpdate(async () => { await gate; return [{ id: 'device-upd' }]; });
 
     const handlers = createAgentWsHandlers('agent-upd-burst', preValidatedAgent);
     const ws = wsMock();
@@ -7672,7 +7699,7 @@ describe('update_status write coalescing', () => {
     const { setMock } = rigUpdate(async () => {
       calls += 1;
       if (calls === 1) throw new Error('db unavailable');
-      return [];
+      return [{ id: 'device-upd' }];
     });
 
     const handlers = createAgentWsHandlers('agent-upd-retry', preValidatedAgent);
@@ -7682,6 +7709,27 @@ describe('update_status write coalescing', () => {
     await handlers.onMessage(frame('2.0.0'), ws as any);
 
     expect(setMock).toHaveBeenCalledTimes(2);
+  });
+
+  // #8318 §6.4 (review of wave 1b-1): `written` is the row count, not "no throw".
+  it('a write that matched no row (terminal status, or the row changed hands) does not suppress the next frame', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let calls = 0;
+    const { setMock } = rigUpdate(async () => {
+      calls += 1;
+      return calls === 1 ? [] : [{ id: 'device-upd' }];
+    });
+
+    const handlers = createAgentWsHandlers('agent-upd-zero-rows', preValidatedAgent);
+    const ws = wsMock();
+    await handlers.onMessage(frame('2.0.0'), ws as any);
+    await handlers.onMessage(frame('2.0.0'), ws as any);
+    await handlers.onMessage(frame('2.0.0'), ws as any);
+
+    // 0 rows → not written → the second frame writes again; that one lands → the third is absorbed.
+    expect(setMock).toHaveBeenCalledTimes(2);
+    expect(warnSpy.mock.calls.some((call) => String(call[0]).includes('matched no device row'))).toBe(true);
+    warnSpy.mockRestore();
   });
 
   it('different devices are coalesced independently', async () => {
