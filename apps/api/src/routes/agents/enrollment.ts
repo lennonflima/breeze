@@ -880,15 +880,15 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
             deviceRoleSource: 'auto',
             isVirtual: data.isVirtual ?? false,
             virtualizationPlatform: data.virtualizationPlatform ?? null,
+            // #8318 §6.2: re-enroll is a new install, so its declared rebind
+            // capability is rewritten (not blindly reset to 0).
+            rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
             // A new install: what the previous one reported about its backup
             // helper no longer holds. Backups and restores for this device
             // wait for the new install's first heartbeat, as for a new device.
             backupReadProtocolVersion: null,
             backupIntegrityProtocolVersion: null,
             backupWriteProtocolVersion: null,
-            // #8318 §6.2: re-enroll is a new install, so its declared rebind
-            // capability is rewritten (not blindly reset to 0).
-            rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
             status: 'pending',
             updatedAt: new Date(),
           })
