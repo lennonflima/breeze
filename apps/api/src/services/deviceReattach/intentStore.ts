@@ -124,6 +124,22 @@ export async function readIntentForUpdate(tx: ReattachTx, intentId: string): Pro
   return row ?? null;
 }
 
+/**
+ * Lock every open intent naming this device in either role (FOR UPDATE), for
+ * the holding-area housekeeping that runs under the holding-area lock and the
+ * device lock (parked expiry and purge, §6.5).
+ */
+export async function lockOpenReattachIntentsOfDevice(tx: ReattachTx, deviceId: string): Promise<DeviceReattachIntent[]> {
+  return tx
+    .select()
+    .from(deviceReattachIntents)
+    .where(and(
+      inArray(deviceReattachIntents.state, [...OPEN_REATTACH_INTENT_STATES]),
+      or(eq(deviceReattachIntents.sourceDeviceId, deviceId), eq(deviceReattachIntents.targetDeviceId, deviceId)),
+    ))
+    .for('update');
+}
+
 /** Is either device in an open intent, in either role? */
 export async function anyDeviceInOpenIntent(tx: ReattachTx, deviceIds: readonly string[]): Promise<boolean> {
   const [row] = await tx

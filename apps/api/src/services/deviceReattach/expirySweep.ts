@@ -18,7 +18,7 @@
  *
  * Deliberately free of routes/agentWs.ts: the job is `global` placement.
  */
-import { and, asc, inArray, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, inArray, lt, lte } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import { deviceReattachIntents } from '../../db/schema';
 import { captureException } from '../sentry';
@@ -120,6 +120,3 @@ export async function runReattachIntentSweepOnce(now: Date = new Date()): Promis
   }
   return summary;
 }
-
-// Referenced so the import list stays honest if a raw fragment is added later.
-void sql;
