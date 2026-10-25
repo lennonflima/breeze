@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { db, withSystemDbAccessContext, type DbAccessContext } from '../../db';
 import {
@@ -20,9 +21,11 @@ import type { RunIssue } from './runReport';
  * rows. Every function runs in `runContext(partnerId)`, a partner-scoped
  * context with no orgs and no user, so RLS bounds a slice to its own
  * partner. Each write is guarded by the slice's compare-and-set: a commit
- * changes the run only while `slice_seq` equals the slice's seq and the run
- * is running, and otherwise throws `SliceSupersededError` and rolls back, so
- * a retried slice whose successor ran, or a cancelled run, writes nothing.
+ * changes the run only while `slice_seq` equals the slice's seq, the run is
+ * running, and `slice_token` is the token this execution's claim wrote
+ * (review #10), and otherwise throws `SliceSupersededError` and rolls back.
+ * So a retried slice whose successor ran, a cancelled run, and a duplicate
+ * execution of one seq (whichever claimed first) write nothing.
  * Every caller-facing write of these tables is gated in routes/ticketImports.
  */
 
@@ -80,11 +83,18 @@ export async function loadRun(partnerId: string, runId: string): Promise<SliceRu
   return row ?? null;
 }
 
-/** Marks the run running for this slice; false when the slice no longer owns it. */
-export async function claimSlice(partnerId: string, runId: string, seq: number): Promise<boolean> {
+/**
+ * Claims the run for one execution of this slice: marks it running and
+ * writes a fresh owner token in the statement that checks `slice_seq`.
+ * Returns the token every commit must present, or null when the slice no
+ * longer owns the run. A second execution of the same seq overwrites the
+ * token, so the earlier one's next commit fails.
+ */
+export async function claimSlice(partnerId: string, runId: string, seq: number): Promise<string | null> {
+  const token = randomUUID();
   const rows = await db
     .update(ticketImportRuns)
-    .set({ state: 'running', heartbeatAt: new Date() })
+    .set({ state: 'running', heartbeatAt: new Date(), sliceToken: token, resumeAt: null })
     .where(and(
       eq(ticketImportRuns.id, runId),
       eq(ticketImportRuns.partnerId, partnerId),
@@ -92,7 +102,7 @@ export async function claimSlice(partnerId: string, runId: string, seq: number):
       inArray(ticketImportRuns.state, [...TICKET_IMPORT_ACTIVE_RUN_STATES]),
     ))
     .returning({ id: ticketImportRuns.id });
-  return rows.length > 0;
+  return rows.length > 0 ? token : null;
 }
 
 export type ItemRow = {
@@ -208,7 +218,7 @@ export type SliceCommit = {
  * `runContext`). The run's UPDATE goes first and is the gate: it matches only
  * while this slice owns a running run.
  */
-export async function commitSlice(partnerId: string, runId: string, seq: number, commit: SliceCommit): Promise<void> {
+export async function commitSlice(partnerId: string, runId: string, seq: number, token: string, commit: SliceCommit): Promise<void> {
   const now = new Date();
   const updated = await db
     .update(ticketImportRuns)
@@ -218,7 +228,7 @@ export async function commitSlice(partnerId: string, runId: string, seq: number,
       counters: commit.counters,
       heartbeatAt: now,
       resumeAt: commit.resumeAt ?? null,
-      ...(commit.advance ? { sliceSeq: seq + 1 } : {}),
+      ...(commit.advance ? { sliceSeq: seq + 1, sliceToken: null } : {}),
       ...(commit.finish ? { state: commit.finish.state, stopReason: commit.finish.stopReason, finishedAt: now } : {}),
     })
     .where(and(
@@ -226,6 +236,7 @@ export async function commitSlice(partnerId: string, runId: string, seq: number,
       eq(ticketImportRuns.partnerId, partnerId),
       eq(ticketImportRuns.sliceSeq, seq),
       eq(ticketImportRuns.state, 'running'),
+      eq(ticketImportRuns.sliceToken, token),
     ))
     .returning({ id: ticketImportRuns.id });
   if (updated.length === 0) throw new SliceSupersededError(runId, seq);

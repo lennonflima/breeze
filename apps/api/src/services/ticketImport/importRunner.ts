@@ -121,10 +121,9 @@ export async function runSlice(input: SliceInput, deps: SliceDeps = {}): Promise
   if (!run) return { kind: 'superseded', sliceSeq: null, active: false };
   const active = run.state === 'queued' || run.state === 'running';
   if (run.sliceSeq !== input.seq || !active) return { kind: 'superseded', sliceSeq: run.sliceSeq, active };
-  if (!(await withDbAccessContext(ctx, () => claimSlice(input.partnerId, input.runId, input.seq)))) {
-    return { kind: 'superseded', sliceSeq: null, active: true };
-  }
-  const runner = new SliceRunner(input, run, deps);
+  const token = await withDbAccessContext(ctx, () => claimSlice(input.partnerId, input.runId, input.seq));
+  if (!token) return { kind: 'superseded', sliceSeq: null, active: true };
+  const runner = new SliceRunner(input, run, token, deps);
   try {
     return await runner.execute();
   } catch (error) {
@@ -164,7 +163,13 @@ class SliceRunner {
   private principalId!: string;
   private contactOrgIds: string[] = [];
 
-  constructor(private readonly input: SliceInput, private readonly run: SliceRun, private readonly deps: SliceDeps) {
+  constructor(
+    private readonly input: SliceInput,
+    private readonly run: SliceRun,
+    /** This execution's claim (review #10): every commit presents it. */
+    private readonly claimToken: string,
+    private readonly deps: SliceDeps,
+  ) {
     this.now = deps.now ?? (() => new Date());
     this.limits = deps.limits ?? ticketImportLimits();
     this.startedAt = this.now().getTime();
@@ -259,7 +264,7 @@ class SliceRunner {
   private async commit(extra: { advance?: boolean; finish?: { state: 'completed' | 'stopped' | 'failed'; stopReason: string | null }; resumeAt?: Date } = {}): Promise<void> {
     const items = this.pending;
     this.pending = [];
-    await withDbAccessContext(runContext(this.input.partnerId), () => commitSlice(this.input.partnerId, this.input.runId, this.input.seq, {
+    await withDbAccessContext(runContext(this.input.partnerId), () => commitSlice(this.input.partnerId, this.input.runId, this.input.seq, this.claimToken, {
       sourceId: this.run.sourceId,
       phase: this.phase,
       cursor: this.cursor as unknown as Record<string, unknown>,

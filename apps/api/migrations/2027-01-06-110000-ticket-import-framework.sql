@@ -102,6 +102,9 @@ CREATE TABLE IF NOT EXISTS ticket_import_runs (
   phase text NOT NULL DEFAULT 'scan',
   cursor jsonb NOT NULL DEFAULT '{}',
   slice_seq integer NOT NULL DEFAULT 0,
+  -- The execution that claimed the current slice: every commit of a slice
+  -- requires it, so a duplicate execution of one seq writes nothing.
+  slice_token uuid,
   counters jsonb NOT NULL DEFAULT '{}',
   options jsonb NOT NULL,
   started_by uuid REFERENCES users(id) ON DELETE SET NULL,

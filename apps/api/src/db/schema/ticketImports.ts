@@ -156,6 +156,8 @@ export const ticketImportRuns = pgTable('ticket_import_runs', {
   phase: text('phase').$type<TicketImportRunPhase>().notNull().default('scan'),
   cursor: jsonb('cursor').$type<Record<string, unknown>>().notNull().default({}),
   sliceSeq: integer('slice_seq').notNull().default(0),
+  // The execution that claimed the current slice; every commit requires it.
+  sliceToken: uuid('slice_token'),
   counters: jsonb('counters').$type<Record<string, unknown>>().notNull().default({}),
   // The source's module options when the run started.
   options: jsonb('options').$type<Record<string, unknown>>().notNull(),
