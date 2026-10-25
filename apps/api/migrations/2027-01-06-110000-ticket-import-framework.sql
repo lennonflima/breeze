@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS ticket_import_runs (
   started_by uuid REFERENCES users(id) ON DELETE SET NULL,
   started_at timestamptz NOT NULL DEFAULT now(),
   heartbeat_at timestamptz,
+  -- When a deferred slice is due back (a busy lease, a 429, a Retry-After):
+  -- the stalled-run sweep counts it as a sign of life.
+  resume_at timestamptz,
   finished_at timestamptz,
   CONSTRAINT ticket_import_runs_id_partner_uq UNIQUE (id, partner_id),
   CONSTRAINT ticket_import_runs_source_fk FOREIGN KEY (source_id, partner_id)

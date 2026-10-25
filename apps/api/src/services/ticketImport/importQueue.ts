@@ -13,6 +13,8 @@ import type { TicketImportSliceJobData } from '../../jobs/queueSchemas';
 
 export const TICKET_IMPORT_QUEUE = 'ticket-import';
 export const TICKET_IMPORT_SLICE_JOB = 'slice';
+/** The stalled-run sweep, a repeatable job on the same queue (review #9). */
+export const TICKET_IMPORT_SWEEP_JOB = 'stalled-run-sweep';
 export const TICKET_IMPORT_SLICE_ATTEMPTS = 3;
 
 let queue: Queue | null = null;

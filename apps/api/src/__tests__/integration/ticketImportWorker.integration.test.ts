@@ -42,7 +42,7 @@ import {
   ticketImportRunIssues,
   tickets,
 } from '../../db/schema';
-import { processTicketImportSlice } from '../../jobs/ticketImportWorker';
+import { handleTicketImportJobFailed, processTicketImportJob, processTicketImportSlice, runStalledRunSweep } from '../../jobs/ticketImportWorker';
 import { MigrationWindowError } from '../../services/migrationWindows';
 import { getBullMQConnection } from '../../services/redis';
 import { ticketImportLimits } from '../../services/ticketImport/importLimits';
@@ -426,6 +426,68 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
       items: [{ ...base, sourceTicketKey: 'dup', state: 'failed' }, { ...base, sourceTicketKey: 'dup', state: 'skipped' }],
     }));
     expect((await ledger(fx.sourceId)).get('dup')).toMatchObject({ state: 'skipped', seenVersion: 'v9' });
+  }, CASE_TIMEOUT);
+
+  runDb('a successor that cannot be enqueued fails the run instead of leaving it running (review #9a)', async () => {
+    const fx = await seedImport();
+    fx.source.tickets = fakeTickets(['e1', 'e2']);
+    const window = await openWindow(fx);
+    const run = await startImportRun(fx, 'import', window.id);
+    let attempts = 0;
+    const out = await processTicketImportSlice(sliceJob({ runId: run.id, partnerId: fx.partner.id, seq: 0 }), 'tok', {
+      ...oneTicketPerSlice,
+      enqueueRetryDelaysMs: [1, 1],
+      enqueue: async () => { attempts += 1; throw new Error('Redis unavailable'); },
+    });
+    expect(attempts).toBe(3);
+    expect(out).toEqual({ kind: 'finished', state: 'failed', stopReason: 'worker_error' });
+    expect(await runRow(run.id)).toMatchObject({ state: 'failed', stopReason: 'worker_error' });
+    // The source is free for a new run, which resumes from the ledger.
+    const next = await startImportRun(fx, 'import', window.id);
+    await drive(fx, next.id);
+    expect(normalizeCounters((await runRow(next.id)).counters).tickets).toMatchObject({ unchanged: 1, created: 1 });
+  }, CASE_TIMEOUT);
+
+  runDb('the stalled-run sweep fails a run with no sign of life, and leaves deferred and live ones alone (review #9b)', async () => {
+    const stale = await seedImport();
+    const deferred = await seedImport();
+    const live = await seedImport();
+    const staleRun = await startImportRun(stale, 'dry_run');
+    const deferredRun = await startImportRun(deferred, 'dry_run');
+    const liveRun = await startImportRun(live, 'dry_run');
+    const hoursAgo = sql`now() - interval '2 hours'`;
+    await getTestDb().execute(sql`UPDATE ticket_import_runs SET state = 'running', started_at = ${hoursAgo}, heartbeat_at = ${hoursAgo} WHERE id = ${staleRun.id}`);
+    // Deferred for a long 429: its heartbeat is old, but it is due back later.
+    await getTestDb().execute(sql`UPDATE ticket_import_runs SET state = 'running', started_at = ${hoursAgo}, heartbeat_at = ${hoursAgo}, resume_at = now() + interval '10 minutes' WHERE id = ${deferredRun.id}`);
+
+    const out = await processTicketImportJob({ name: 'stalled-run-sweep', data: {}, opts: {} } as unknown as Job, 'tok');
+    expect(out).toEqual({ failed: 1 });
+    expect(await runRow(staleRun.id)).toMatchObject({ state: 'failed', stopReason: 'worker_lost' });
+    expect((await runRow(deferredRun.id)).state).toBe('running');
+    expect((await runRow(liveRun.id)).state).toBe('queued');
+    expect(await runStalledRunSweep()).toEqual({ failed: 0 });
+    // The swept source can run again.
+    await expect(startImportRun(stale, 'dry_run')).resolves.toMatchObject({ state: 'queued' });
+  }, CASE_TIMEOUT);
+
+  runDb('BullMQ\'s failed event fails the run of a slice that exhausted its attempts (review #9c)', async () => {
+    const fx = await seedImport();
+    const run = await startImportRun(fx, 'dry_run');
+    const data = { runId: run.id, partnerId: fx.partner.id, seq: 0 };
+    expect(await handleTicketImportJobFailed(sliceJob(data, 1), new Error('stalled'))).toBe(false);
+    expect((await runRow(run.id)).state).toBe('queued');
+    expect(await handleTicketImportJobFailed(sliceJob(data, 3), new Error('job stalled more than allowable limit'))).toBe(true);
+    expect(await runRow(run.id)).toMatchObject({ state: 'failed', stopReason: 'worker_error' });
+  }, CASE_TIMEOUT);
+
+  runDb('a slice waiting on a busy lease records when it is due back', async () => {
+    const fx = await seedImport();
+    const run = await startImportRun(fx, 'dry_run');
+    const job = sliceJob({ runId: run.id, partnerId: fx.partner.id, seq: 0 });
+    await expect(processTicketImportSlice(job, 'tok', { acquireLease: async () => null })).rejects.toMatchObject({ name: 'DelayedError' });
+    const row = await runRow(run.id);
+    expect(row.heartbeatAt).not.toBeNull();
+    expect(row.resumeAt!.getTime()).toBeGreaterThan(Date.now());
   }, CASE_TIMEOUT);
 
   runDb('merged_in_breeze and removed_in_breeze are final across passes', async () => {

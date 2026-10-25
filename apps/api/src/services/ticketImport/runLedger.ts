@@ -1,5 +1,5 @@
 import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from 'drizzle-orm';
-import { db, type DbAccessContext } from '../../db';
+import { db, withSystemDbAccessContext, type DbAccessContext } from '../../db';
 import {
   ticketImportCategoryMaps,
   ticketImportItems,
@@ -198,6 +198,8 @@ export type SliceCommit = {
   /** Hand the run to slice seq + 1 (the compare-and-set of §5.8). */
   advance?: boolean;
   finish?: { state: Extract<TicketImportRunState, 'completed' | 'stopped' | 'failed'>; stopReason: string | null };
+  /** A deferral: when the slice is due back (a sign of life for the stalled-run sweep). */
+  resumeAt?: Date;
 };
 
 /**
@@ -215,6 +217,7 @@ export async function commitSlice(partnerId: string, runId: string, seq: number,
       cursor: commit.cursor,
       counters: commit.counters,
       heartbeatAt: now,
+      resumeAt: commit.resumeAt ?? null,
       ...(commit.advance ? { sliceSeq: seq + 1 } : {}),
       ...(commit.finish ? { state: commit.finish.state, stopReason: commit.finish.stopReason, finishedAt: now } : {}),
     })
@@ -278,4 +281,44 @@ export async function failRun(partnerId: string, runId: string, stopReason: stri
     ))
     .returning({ id: ticketImportRuns.id });
   return rows.length > 0;
+}
+
+/**
+ * A sign of life for a run whose slice was deferred before it could claim the
+ * run (a busy lease): the heartbeat now, and when the slice is due back.
+ */
+export async function touchRun(partnerId: string, runId: string, resumeAt: Date): Promise<void> {
+  await db
+    .update(ticketImportRuns)
+    .set({ heartbeatAt: new Date(), resumeAt })
+    .where(and(
+      eq(ticketImportRuns.id, runId),
+      eq(ticketImportRuns.partnerId, partnerId),
+      inArray(ticketImportRuns.state, [...TICKET_IMPORT_ACTIVE_RUN_STATES]),
+    ));
+}
+
+export type SweptRun = { id: string; partnerId: string; sourceId: string; kind: TicketImportRunKind };
+
+/**
+ * The stalled-run sweep (review #9): a queued or running run with no sign of
+ * life since `staleBefore` (its heartbeat, the time a deferred slice is due
+ * back, or its start) lost its job, a Redis flush or a lost enqueue. It is
+ * failed as `worker_lost`, which frees its source's one active run; a new run
+ * resumes from the ledger. Runs across partners, so in system scope.
+ */
+export async function sweepStalledRuns(staleBefore: Date): Promise<SweptRun[]> {
+  return withSystemDbAccessContext(() => db
+    .update(ticketImportRuns)
+    .set({ state: 'failed', stopReason: 'worker_lost', finishedAt: new Date() })
+    .where(and(
+      inArray(ticketImportRuns.state, [...TICKET_IMPORT_ACTIVE_RUN_STATES]),
+      sql`GREATEST(COALESCE(${ticketImportRuns.heartbeatAt}, ${ticketImportRuns.startedAt}), COALESCE(${ticketImportRuns.resumeAt}, ${ticketImportRuns.startedAt})) < ${staleBefore.toISOString()}::timestamptz`,
+    ))
+    .returning({
+      id: ticketImportRuns.id,
+      partnerId: ticketImportRuns.partnerId,
+      sourceId: ticketImportRuns.sourceId,
+      kind: ticketImportRuns.kind,
+    }), 'ticketImport.sweepStalledRuns');
 }
