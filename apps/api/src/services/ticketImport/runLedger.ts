@@ -227,7 +227,9 @@ export async function commitSlice(partnerId: string, runId: string, seq: number,
     .returning({ id: ticketImportRuns.id });
   if (updated.length === 0) throw new SliceSupersededError(runId, seq);
 
-  const items = commit.items ?? [];
+  // One row per key: a single upsert cannot touch a row twice (review #8).
+  // The last write staged for a key is its newest state.
+  const items = [...new Map((commit.items ?? []).map((item) => [item.sourceTicketKey, item])).values()];
   for (let i = 0; i < items.length; i += 500) {
     await db
       .insert(ticketImportItems)
