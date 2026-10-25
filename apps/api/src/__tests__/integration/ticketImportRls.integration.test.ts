@@ -37,6 +37,7 @@ import {
 import type { Database } from '../../db';
 import { issuePartnerServicePrincipalKey } from '../../services/partnerServicePrincipalKeys';
 import { registerTicketImportModule } from '../../services/ticketImport/moduleRegistry';
+import { cascadeDeleteOrg, cascadeDeletePartner } from '../../services/tenantCascade';
 import { cancelRun, startRun } from '../../services/ticketImport/runStore';
 import { openSourceCredentials, sealSourceCredentials } from '../../services/ticketImport/sourceCredentials';
 import {
@@ -158,6 +159,29 @@ describe('ticket import tables: RLS and composite FKs (real Postgres, as breeze_
       sourceId: a.sourceId, partnerId: a.partner.id, sourceOrgKey: null, orgId: a.orgB.id,
     })));
     expect(twoFallbacks).toMatch(/ticket_import_org_maps_fallback_uq/);
+  }, CASE_TIMEOUT);
+});
+
+describe('ticket import tables: erasure', () => {
+  runDb('erasing an org drops it from the org maps and leaves the source; erasing the partner removes all six tables', async () => {
+    const fx = await fixtureWithRows();
+    await withDbAccessContext(fx.ownerContext(), () => cancelRun(fx.partner.id, fx.runId));
+    const window = await openWindow(fx, [fx.orgA.id, fx.orgB.id]);
+    await startImportRun(fx, 'import', window.id);
+    const count = (table: string) => withSystemDbAccessContext(async () =>
+      Number((await db.execute<{ n: number }>(sql`SELECT count(*)::int AS n FROM ${sql.identifier(table)} WHERE partner_id = ${fx.partner.id}`))[0]!.n));
+    const TABLES = ['ticket_import_sources', 'ticket_import_org_maps', 'ticket_import_category_maps', 'ticket_import_runs', 'ticket_import_items', 'ticket_import_run_issues'];
+
+    // fixtureWithRows maps acme -> orgA only.
+    expect(await count('ticket_import_org_maps')).toBe(1);
+    await cascadeDeleteOrg(fx.orgA.id, fx.owner.id);
+    expect(await count('ticket_import_org_maps')).toBe(0);
+    expect(await count('ticket_import_sources')).toBe(1);
+
+    // CONTROL: every table holds rows of the partner before the sweep.
+    for (const table of TABLES.filter((t) => t !== 'ticket_import_org_maps')) expect(await count(table), table).toBeGreaterThan(0);
+    await expect(cascadeDeletePartner(fx.partner.id, randomUUID())).resolves.toBeDefined();
+    for (const table of TABLES) expect(await count(table), table).toBe(0);
   }, CASE_TIMEOUT);
 });
 
