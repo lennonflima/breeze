@@ -60,7 +60,7 @@ export type FakeSource = {
   /** Keys left out of the list but still `present` on probe (an offset shift). */
   shifted: Set<string>;
   /** Queued failures, thrown once each, in order. */
-  failures: { connect: unknown[]; scan: unknown[]; load: Map<string, unknown[]>; file: Map<string, unknown[]> };
+  failures: { connect: unknown[]; scan: unknown[]; load: Map<string, unknown[]>; file: Map<string, unknown[]>; probe: Map<string, unknown[]> };
   calls: { connect: number; scan: number; load: string[]; probe: string[]; files: string[] };
   clockSkewMs: number | null;
 };
@@ -75,7 +75,7 @@ export function fakeSource(baseUrl: string, init: Partial<Pick<FakeSource, 'tick
     deleted: new Set(),
     hidden: new Set(),
     shifted: new Set(),
-    failures: { connect: [], scan: [], load: new Map(), file: new Map() },
+    failures: { connect: [], scan: [], load: new Map(), file: new Map(), probe: new Map() },
     calls: { connect: 0, scan: 0, load: [], probe: [], files: [] },
     clockSkewMs: init.clockSkewMs ?? 0,
   };
@@ -216,6 +216,7 @@ export const fakeTicketImportModule: TicketImportModule<FakeOptions, number> = {
   async probe(src, key): Promise<ProbeResult> {
     const source = sourceOf(src);
     source.calls.probe.push(key);
+    takeFailure(source.failures.probe.get(key));
     if (source.deleted.has(key)) return { state: 'deleted' };
     if (source.hidden.has(key)) return { state: 'hidden' };
     const ticket = source.tickets.find((t) => t.key === key);

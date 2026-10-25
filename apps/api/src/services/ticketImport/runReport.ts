@@ -25,6 +25,9 @@ export const RUN_ISSUE_KINDS = [
   'org_changed',
   'deleted_in_source',
   'hidden_in_source',
+  // A deletions probe the source could not answer now: the ticket stays
+  // imported and unseen, and the next run probes it again (review #5).
+  'probe_deferred',
   // Removed or merged in Breeze (final, §5.9).
   'removed_in_breeze',
   'merged_in_breeze',
