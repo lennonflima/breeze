@@ -46,6 +46,7 @@ import { handleTicketImportJobFailed, processTicketImportJob, processTicketImpor
 import { MigrationWindowError } from '../../services/migrationWindows';
 import { getBullMQConnection } from '../../services/redis';
 import { ticketImportLimits } from '../../services/ticketImport/importLimits';
+import { runSlice } from '../../services/ticketImport/importRunner';
 import { importTicket } from '../../services/ticketImport/importWriter';
 import { registerTicketImportModule } from '../../services/ticketImport/moduleRegistry';
 import { claimSlice, commitSlice, runContext } from '../../services/ticketImport/runLedger';
@@ -419,9 +420,10 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     // Two writes of one key in one commit: the last one wins, no conflict error.
     const next = await startImportRun(fx, 'dry_run');
     const ctx = runContext(fx.partner.id);
-    expect(await withDbAccessContext(ctx, () => claimSlice(fx.partner.id, next.id, 0))).toBeTruthy();
+    const token = await withDbAccessContext(ctx, () => claimSlice(fx.partner.id, next.id, 0));
+    expect(token).not.toBeNull();
     const base = { importedVersion: null, seenVersion: 'v9', seenRunId: next.id, breezeTicketId: null, failureCode: null, attempts: 0 };
-    await withDbAccessContext(ctx, () => commitSlice(fx.partner.id, next.id, 0, {
+    await withDbAccessContext(ctx, () => commitSlice(fx.partner.id, next.id, 0, token!, {
       sourceId: fx.sourceId, phase: 'scan', cursor: {}, counters: {},
       items: [{ ...base, sourceTicketKey: 'dup', state: 'failed' }, { ...base, sourceTicketKey: 'dup', state: 'skipped' }],
     }));
@@ -488,6 +490,42 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     const row = await runRow(run.id);
     expect(row.heartbeatAt).not.toBeNull();
     expect(row.resumeAt!.getTime()).toBeGreaterThan(Date.now());
+  }, CASE_TIMEOUT);
+
+  runDb('a duplicate execution of one seq fails its claim token and writes nothing (review #10)', async () => {
+    const fx = await seedImport();
+    const run = await startImportRun(fx, 'dry_run');
+    const ctx = runContext(fx.partner.id);
+    const first = await withDbAccessContext(ctx, () => claimSlice(fx.partner.id, run.id, 0));
+    const second = await withDbAccessContext(ctx, () => claimSlice(fx.partner.id, run.id, 0));
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+    const commit = { sourceId: fx.sourceId, phase: 'scan' as const, cursor: { marker: 'x' }, counters: {} };
+    await expect(withDbAccessContext(ctx, () => commitSlice(fx.partner.id, run.id, 0, first!, commit)))
+      .rejects.toMatchObject({ name: 'SliceSupersededError' });
+    expect((await runRow(run.id)).cursor).toEqual({});
+    await withDbAccessContext(ctx, () => commitSlice(fx.partner.id, run.id, 0, second!, commit));
+    expect((await runRow(run.id)).cursor).toEqual({ marker: 'x' });
+
+    // Two executions of slice 0 at once (no lease between them): exactly one
+    // goes on, and every ticket is imported once.
+    const fx2 = await seedImport();
+    fx2.source.tickets = fakeTickets(['x1', 'x2', 'x3']);
+    const window = await openWindow(fx2);
+    const run2 = await startImportRun(fx2, 'import', window.id);
+    const input = { runId: run2.id, partnerId: fx2.partner.id, seq: 0 };
+    const outcomes = await Promise.all([runSlice(input), runSlice(input)]);
+    expect(outcomes.filter((o) => o.kind === 'superseded')).toHaveLength(1);
+    expect(outcomes.filter((o) => o.kind !== 'superseded')).toHaveLength(1);
+    // No ticket twice. A ticket both wrote at the same moment is refused to
+    // the later writer (held_elsewhere), so the winner may count it failed;
+    // the next run resumes it.
+    const keys = (await importedTickets(fx2)).map((t) => t.key).sort();
+    expect(keys).toEqual(['x1', 'x2', 'x3']);
+    const t = normalizeCounters((await runRow(run2.id)).counters).tickets;
+    expect(t.seen).toBe(3);
+    expect(t.created + t.resumed + t.failed).toBe(3);
   }, CASE_TIMEOUT);
 
   runDb('merged_in_breeze and removed_in_breeze are final across passes', async () => {
