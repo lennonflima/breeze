@@ -167,11 +167,19 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     const fx = await seedImport();
     fx.source.pageSize = 4;
     fx.source.tickets = fakeTickets(['p1', 'p2', 'p3', 'p4']);
-    // The process dies while loading p3 (an error nothing classifies).
-    fx.source.failures.load.set('p3', [new Error('worker killed')]);
+    // The database connection drops while p3 is written: an infrastructure
+    // fault, which ends the slice (a ticket's own error would not).
+    let dropped = false;
+    const flaky: typeof importTicket = async (windowId, ticket, options) => {
+      if (ticket.sourceId === 'p3' && !dropped) {
+        dropped = true;
+        throw Object.assign(new Error('Connection terminated unexpectedly'), { code: 'CONNECTION_CLOSED' });
+      }
+      return importTicket(windowId, ticket, options);
+    };
     const window = await openWindow(fx);
     const run = await startImportRun(fx, 'import', window.id);
-    const steps = await drive(fx, run.id);
+    const steps = await drive(fx, run.id, { deps: { sliceDeps: { importTicket: flaky } } });
     expect(steps.map((s) => s.outcome)).toEqual(['retried', 'finished']);
     // The page was read again, and only p3 onwards loaded again.
     expect(fx.source.calls.scan).toBe(2);
@@ -182,6 +190,36 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
       .where(and(inArray(ticketComments.ticketId, imported.map((t) => t.id)), isNotNull(ticketComments.importSourceId)));
     expect(comments.length).toBe(4);
     expect(normalizeCounters((await runRow(run.id)).counters).tickets).toMatchObject({ seen: 4, created: 4 });
+  }, CASE_TIMEOUT);
+
+  runDb('one bad ticket never ends the run: module bugs, writer errors and id violations fail only their ticket', async () => {
+    const fx = await seedImport();
+    fx.source.pageSize = 5;
+    fx.source.tickets = [
+      ...fakeTickets(['b1', 'b2', 'b3', 'b4']),
+      ...fakeTickets(['b5'], { wrongSourceId: true }),
+    ];
+    // b1: the module's load throws a TypeError (a module bug).
+    fx.source.failures.load.set('b1', [new TypeError("Cannot read properties of undefined (reading 'id')")]);
+    // b2: the writer throws something nothing maps.
+    const broken: typeof importTicket = async (windowId, ticket, options) => {
+      if (ticket.sourceId === 'b2') throw new RangeError('Invalid time value');
+      return importTicket(windowId, ticket, options);
+    };
+    const window = await openWindow(fx);
+    const run = await startImportRun(fx, 'import', window.id);
+    const steps = await drive(fx, run.id, { deps: { sliceDeps: { importTicket: broken } } });
+    expect(steps.map((s) => s.outcome)).toEqual(['finished']);
+    expect(await runRow(run.id)).toMatchObject({ state: 'completed' });
+    const items = await ledger(fx.sourceId);
+    expect(items.get('b1')).toMatchObject({ state: 'failed', failureCode: 'internal_error', attempts: 1 });
+    expect(items.get('b2')).toMatchObject({ state: 'failed', failureCode: 'internal_error' });
+    // b5's conversion names another ticket: refused visibly, nothing written under either key.
+    expect(items.get('b5')).toMatchObject({ state: 'failed', failureCode: 'module_contract_violation' });
+    expect(items.get('b3')).toMatchObject({ state: 'imported' });
+    expect(items.get('b4')).toMatchObject({ state: 'imported' });
+    expect((await importedTickets(fx)).map((t) => t.key).sort()).toEqual(['b3', 'b4']);
+    expect(normalizeCounters((await runRow(run.id)).counters).tickets).toMatchObject({ seen: 5, created: 2, failed: 3 });
   }, CASE_TIMEOUT);
 
   runDb('a closed window stops the run; a later run resumes from the ledger', async () => {

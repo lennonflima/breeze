@@ -47,6 +47,8 @@ export type FakeTicket = {
   unsupported?: boolean;
   /** Produces a ticket the writer's schema refuses (an empty subject). */
   invalid?: boolean;
+  /** A module bug: the converted ticket names another source id. */
+  wrongSourceId?: boolean;
 };
 
 export type FakeSource = {
@@ -181,7 +183,7 @@ export const fakeTicketImportModule: TicketImportModule<FakeOptions, number> = {
     const updatedAt = t.updatedAt ?? t.createdAt;
     const status = t.status ?? 'open';
     const ticket: ImportedTicket = {
-      sourceId: t.key,
+      sourceId: t.wrongSourceId ? `${t.key}-other` : t.key,
       ...(t.number ? { sourceNumber: t.number } : {}),
       orgId: ctx.orgId,
       createdAt: t.createdAt,
