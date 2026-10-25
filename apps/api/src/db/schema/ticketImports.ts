@@ -162,6 +162,8 @@ export const ticketImportRuns = pgTable('ticket_import_runs', {
   startedBy: uuid('started_by').references(() => users.id, { onDelete: 'set null' }),
   startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
   heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }),
+  // When a deferred slice is due back; a sign of life for the stalled-run sweep.
+  resumeAt: timestamp('resume_at', { withTimezone: true }),
   finishedAt: timestamp('finished_at', { withTimezone: true }),
 }, (t) => [
   unique('ticket_import_runs_id_partner_uq').on(t.id, t.partnerId),

@@ -256,7 +256,7 @@ class SliceRunner {
     if (!this.dryRun) this.pending.push(item);
   }
 
-  private async commit(extra: { advance?: boolean; finish?: { state: 'completed' | 'stopped' | 'failed'; stopReason: string | null } } = {}): Promise<void> {
+  private async commit(extra: { advance?: boolean; finish?: { state: 'completed' | 'stopped' | 'failed'; stopReason: string | null }; resumeAt?: Date } = {}): Promise<void> {
     const items = this.pending;
     this.pending = [];
     await withDbAccessContext(runContext(this.input.partnerId), () => commitSlice(this.input.partnerId, this.input.runId, this.input.seq, {
@@ -276,7 +276,8 @@ class SliceRunner {
         await this.commit({ advance: true });
         return { kind: 'continue' };
       case 'defer':
-        await this.commit();
+        // When the slice is due back: a sign of life for the stalled-run sweep.
+        await this.commit({ resumeAt: new Date(this.now().getTime() + step.delayMs) });
         return { kind: 'defer', delayMs: step.delayMs, reason: step.reason };
       case 'stop':
         return this.finish(step.state ?? 'stopped', step.reason);

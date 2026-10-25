@@ -454,7 +454,7 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   // callerPartner() (routes/ticketImports/shared.ts → canManagePartnerWidePolicies)
   // before any service call; create, edit and mappings are further owner-only.
   'services/ticketImport/sourceStore.ts': 'called only from the gated routes/ticketImports (sources.ts, runs.ts), every one of which passes callerPartner() (canManagePartnerWidePolicies) first; create/edit/mappings are also owner-only',
-  'services/ticketImport/runLedger.ts': 'the ticket-import worker\'s writes (run cursor and counters, the per-source ledger, issue rows) under a partner-scoped context with no caller; every caller-facing write of these tables is gated in routes/ticketImports (callerPartner → canManagePartnerWidePolicies)',
+  'services/ticketImport/runLedger.ts': 'the ticket-import worker\'s writes (run cursor and counters, the per-source ledger, issue rows) under a partner-scoped context with no caller, and the stalled-run sweep (system scope, fails runs with no sign of life, no caller); every caller-facing write of these tables is gated in routes/ticketImports (callerPartner → canManagePartnerWidePolicies)',
   'services/ticketImport/runStore.ts': 'called only from the gated routes/ticketImports/runs.ts (start, cancel, fail-on-enqueue), every one of which passes callerPartner() (canManagePartnerWidePolicies) first',
   // Partner Entitlements W1 (#9907). partner_entitlements rows are COMMERCIAL
   // facts, not partner-wide configuration: a partner must never write them, so
