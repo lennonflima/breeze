@@ -48,6 +48,7 @@ import { getBullMQConnection } from '../../services/redis';
 import { ticketImportLimits } from '../../services/ticketImport/importLimits';
 import { importTicket } from '../../services/ticketImport/importWriter';
 import { registerTicketImportModule } from '../../services/ticketImport/moduleRegistry';
+import { claimSlice, commitSlice, runContext } from '../../services/ticketImport/runLedger';
 import { normalizeCounters } from '../../services/ticketImport/runReport';
 import { SourceAuthError, SourceUnavailableError } from '../../services/ticketImport/sourceFetch';
 import { clearFakeSources, fakeTicketImportModule } from '../../services/ticketImport/testing/fakeModule';
@@ -400,6 +401,31 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     expect(await runRow(run2.id)).toMatchObject({ state: 'completed' });
     expect((await ledger(fx2.sourceId)).get('u2')).toMatchObject({ state: 'imported' });
     expect(normalizeCounters((await runRow(run2.id)).counters)).toMatchObject({ tickets: { failed: 0, resumed: 1 }, attachments: { written: 1 } });
+  }, CASE_TIMEOUT);
+
+  runDb('a key listed twice in one page is processed once, and the ledger commit keeps one row per key (review #8)', async () => {
+    const fx = await seedImport();
+    fx.source.pageSize = 4;
+    const [dup, other] = fakeTickets(['dup', 'other']);
+    fx.source.tickets = [dup!, other!, dup!];
+    const window = await openWindow(fx);
+    const run = await startImportRun(fx, 'import', window.id);
+    await drive(fx, run.id);
+    expect(await runRow(run.id)).toMatchObject({ state: 'completed' });
+    expect(fx.source.calls.load.sort()).toEqual(['dup', 'other']);
+    expect(normalizeCounters((await runRow(run.id)).counters).tickets).toMatchObject({ seen: 2, created: 2 });
+    expect([...(await ledger(fx.sourceId)).keys()].sort()).toEqual(['dup', 'other']);
+
+    // Two writes of one key in one commit: the last one wins, no conflict error.
+    const next = await startImportRun(fx, 'dry_run');
+    const ctx = runContext(fx.partner.id);
+    expect(await withDbAccessContext(ctx, () => claimSlice(fx.partner.id, next.id, 0))).toBeTruthy();
+    const base = { importedVersion: null, seenVersion: 'v9', seenRunId: next.id, breezeTicketId: null, failureCode: null, attempts: 0 };
+    await withDbAccessContext(ctx, () => commitSlice(fx.partner.id, next.id, 0, {
+      sourceId: fx.sourceId, phase: 'scan', cursor: {}, counters: {},
+      items: [{ ...base, sourceTicketKey: 'dup', state: 'failed' }, { ...base, sourceTicketKey: 'dup', state: 'skipped' }],
+    }));
+    expect((await ledger(fx.sourceId)).get('dup')).toMatchObject({ state: 'skipped', seenVersion: 'v9' });
   }, CASE_TIMEOUT);
 
   runDb('merged_in_breeze and removed_in_breeze are final across passes', async () => {

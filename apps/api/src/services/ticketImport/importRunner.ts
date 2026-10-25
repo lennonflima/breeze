@@ -313,8 +313,16 @@ class SliceRunner {
     const existing = await withDbAccessContext(runContext(this.input.partnerId), () =>
       readItems(this.input.partnerId, this.run.sourceId, rows.map((r) => r.key)));
     const refs = await keysWithRef(this.principalId, rows.filter((r) => this.needsRefCheck(r, existing.get(r.key))).map((r) => r.key));
+    // A key a source lists twice in one page is processed once, the first
+    // time (review #8); keys of rows done before a crash count as handled.
+    const handled = new Set(rows.slice(0, this.cursor.scan.index).map((r) => r.key));
     for (let i = this.cursor.scan.index; i < rows.length; i += 1) {
       if (this.timeUp()) return { kind: 'yield' };
+      if (handled.has(rows[i]!.key)) {
+        this.cursor.scan.index = i + 1;
+        continue;
+      }
+      handled.add(rows[i]!.key);
       const result = await this.processRow(rows[i]!, existing.get(rows[i]!.key), refs);
       if (result.kind !== 'done') return result;
       this.cursor.scan.index = i + 1;
