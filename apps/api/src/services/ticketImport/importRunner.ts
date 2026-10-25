@@ -1,6 +1,7 @@
 import { withDbAccessContext } from '../../db';
 import type { TicketImportRunPhase } from '../../db/schema';
 import { createAuditLogAsync } from '../auditService';
+import { captureException } from '../sentry';
 import { MigrationWindowError } from '../migrationWindows';
 import { parseImportedTicket, type ImportedTicket } from './importedTicket';
 import { ticketImportLimits, type TicketImportLimits } from './importLimits';
@@ -28,7 +29,9 @@ import {
   clampTicketTimes,
   classifyImportError,
   classifySourceError,
+  conversionIdentityViolation,
   importedTicketBytes,
+  isInfrastructureError,
   predictTicket,
   recordImportResult,
   type IssueTarget,
@@ -381,6 +384,12 @@ class SliceRunner {
     };
   }
 
+  /** An unexpected error confined to one ticket: logged and reported, never rethrown. */
+  private reportTicketFault(error: unknown, key: string, stage: string): void {
+    console.warn('[ticketImport] ticket failed', { runId: this.input.runId, key, stage, error: error instanceof Error ? error.name : 'unknown' });
+    captureException(error, undefined, { service: 'ticketImport', stage });
+  }
+
   private failItem(row: SourceRow, item: ItemRow | undefined, target: IssueTarget, code: string): RowResult {
     this.counters.tickets.failed += 1;
     this.issues.add({ sourceTicketKey: target.key, sourceTicketNumber: target.number, kind: 'failed', code: code.slice(0, 64) });
@@ -403,9 +412,11 @@ class SliceRunner {
     try {
       conversion = this.module.convert(loaded, context);
     } catch (error) {
-      console.warn('[ticketImport] conversion failed', { runId: this.input.runId, key: row.key, error: error instanceof Error ? error.name : 'unknown' });
+      this.reportTicketFault(error, row.key, 'convert');
       return this.failItem(row, item, target, 'conversion_error');
     }
+    // A conversion must import the ticket its row names (§5.2 ids).
+    if (conversionIdentityViolation(conversion, row.key)) return this.failItem(row, item, target, 'module_contract_violation');
     applyNotes(conversion.notes, this.counters, this.issues, this.cursor, target);
     if (conversion.kind === 'skip') {
       this.counters.tickets.skipped += 1;
@@ -440,7 +451,11 @@ class SliceRunner {
       if (failure.kind === 'failed') return this.failItem(row, item, issueTarget, failure.code);
       if (failure.kind === 'stop') return { kind: 'stop', reason: failure.reason };
       if (failure.kind === 'defer') return { kind: 'defer', delayMs: failure.delayMs, reason: 'window_rate_limited' };
-      throw error;
+      // Anything else is this ticket's alone (review #1), unless Breeze's own
+      // infrastructure failed: then the slice ends and is retried.
+      if (isInfrastructureError(error)) throw error;
+      this.reportTicketFault(error, row.key, 'import');
+      return this.failItem(row, item, issueTarget, 'internal_error');
     }
     if (result.outcome === 'skipped' && result.skip?.reason === 'merged_in_breeze') {
       this.counters.mergedInBreeze += 1;
@@ -471,7 +486,10 @@ class SliceRunner {
     try {
       parseImportedTicket(ticket, this.now());
     } catch (error) {
-      if (!(error instanceof MigrationWindowError)) throw error;
+      if (!(error instanceof MigrationWindowError)) {
+        this.reportTicketFault(error, row.key, 'parse');
+        return this.failItem(row, item, target, 'internal_error');
+      }
       this.counters.predicted.invalid += 1;
       return this.failItem(row, item, target, error.code);
     }
@@ -536,7 +554,12 @@ class SliceRunner {
   private ticketSourceTrouble(error: unknown, row: SourceRow, item: ItemRow | undefined, target: IssueTarget): RowResult {
     const f = classifySourceError(error);
     if (f.kind === 'unauthorized') return { kind: 'stop', reason: 'source_unauthorized' };
-    if (f.kind === 'rethrow') throw error;
+    if (f.kind === 'rethrow') {
+      // A module bug or an unexpected answer: this ticket fails, the run goes on.
+      if (isInfrastructureError(error)) throw error;
+      this.reportTicketFault(error, row.key, 'source');
+      return this.failItem(row, item, target, 'internal_error');
+    }
     if (f.kind === 'http') return this.failItem(row, item, target, `source_${f.status}`);
     if (f.kind === 'too_large') return this.failItem(row, item, target, 'ticket_too_large');
     if (f.retryAfterMs !== null) return { kind: 'defer', delayMs: f.retryAfterMs, reason: 'source_retry_after' };
@@ -553,7 +576,14 @@ class SliceRunner {
     while (writer && this.cursor.links.index < queue.length) {
       if (this.timeUp()) return { kind: 'yield' };
       const link = queue[this.cursor.links.index]!;
-      const result = await writer.writeLink(this.window!.id, { ...link, at: new Date(link.at) }, { partnerId: this.input.partnerId });
+      let result: Awaited<ReturnType<ImportLinkWriter['writeLink']>>;
+      try {
+        result = await writer.writeLink(this.window!.id, { ...link, at: new Date(link.at) }, { partnerId: this.input.partnerId });
+      } catch (error) {
+        if (isInfrastructureError(error)) throw error;
+        this.reportTicketFault(error, link.sourceKey, 'link');
+        result = { outcome: 'not_written', code: 'internal_error', retry: true };
+      }
       const done = result.outcome !== 'not_written' || result.retry !== true;
       if (result.outcome === 'not_written') {
         this.counters.linksAsNotes += 1;

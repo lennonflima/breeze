@@ -10,7 +10,9 @@ import {
   clampTicketTimes,
   classifyImportError,
   classifySourceError,
+  conversionIdentityViolation,
   importedTicketBytes,
+  isInfrastructureError,
   predictTicket,
   recordImportResult,
 } from './runOutcomes';
@@ -209,5 +211,32 @@ describe('the stored run state', () => {
     vi.stubEnv('TICKET_IMPORT_SLICE_MS', 'soon');
     vi.stubEnv('TICKET_IMPORT_LEASE_MS', '10');
     expect(ticketImportLimits()).toMatchObject({ sliceMs: 300_000, leaseMs: 5_000 });
+  });
+});
+
+describe('isInfrastructureError and the conversion identity (review #1, #3)', () => {
+  it('ends the slice only for faults of Breeze\'s own infrastructure', () => {
+    const conn = Object.assign(new Error('Connection terminated'), { code: 'CONNECTION_CLOSED' });
+    expect(isInfrastructureError(conn)).toBe(true);
+    expect(isInfrastructureError(Object.assign(new Error('x'), { code: 'ECONNRESET' }))).toBe(true);
+    expect(isInfrastructureError(Object.assign(new Error('admin shutdown'), { code: '57P01' }))).toBe(true);
+    expect(isInfrastructureError(Object.assign(new Error('too many'), { code: '53300' }))).toBe(true);
+    expect(isInfrastructureError(new Error('wrapped', { cause: conn }))).toBe(true);
+    const superseded = new Error('lost');
+    superseded.name = 'SliceSupersededError';
+    expect(isInfrastructureError(superseded)).toBe(true);
+    // A ticket's own failures.
+    expect(isInfrastructureError(new TypeError('bug'))).toBe(false);
+    expect(isInfrastructureError(Object.assign(new Error('unique'), { code: '23505' }))).toBe(false);
+    expect(isInfrastructureError(Object.assign(new Error('timeout'), { code: '57014' }))).toBe(false);
+    expect(isInfrastructureError(new TicketServiceError('no', 400, 'ASSIGNEE_NOT_ELIGIBLE'))).toBe(false);
+    expect(isInfrastructureError(new MigrationWindowError('MIGRATION_IMPORT_INVALID', 'x', 400))).toBe(false);
+  });
+
+  it('refuses a conversion whose ticket is not the row\'s', () => {
+    const base = { links: [], notes: [] };
+    expect(conversionIdentityViolation({ kind: 'ticket', ticket: ticket({ sourceId: '41' }), ...base }, '41')).toBe(false);
+    expect(conversionIdentityViolation({ kind: 'ticket', ticket: ticket({ sourceId: '42' }), ...base }, '41')).toBe(true);
+    expect(conversionIdentityViolation({ kind: 'skip', code: 'unsupported', notes: [] }, '41')).toBe(false);
   });
 });

@@ -3,7 +3,7 @@ import { TicketServiceError } from '../ticketService';
 import { IMPORT_ATTACHMENT_MAX_BYTES } from './importAttachments';
 import type { ImportedTicket } from './importedTicket';
 import type { ImportTicketResult } from './importWriter';
-import type { ReportNote } from './moduleContract';
+import type { Conversion, ReportNote } from './moduleContract';
 import { rememberOwner, type RunCursor } from './runCursor';
 import type { IssueBuffer, RunCounters } from './runReport';
 import { SourceAuthError, SourceHttpError, SourceResponseTooLargeError, SourceUnavailableError } from './sourceFetch';
@@ -216,4 +216,47 @@ export function classifySourceError(error: unknown): SourceFailure {
   if (error instanceof SourceUnavailableError) return { kind: 'unavailable', retryAfterMs: error.retryAfterMs };
   if (error instanceof SourceResponseTooLargeError) return { kind: 'too_large' };
   return { kind: 'rethrow' };
+}
+
+/**
+ * A fault of Breeze's own infrastructure rather than of the ticket being
+ * imported (review #1): a lost slice claim, a database connection or server
+ * failure, a pool that cannot hand out a connection. Such an error ends the
+ * slice (BullMQ retries it from the saved position); anything else that
+ * happens while one ticket is loaded, converted or written fails only that
+ * ticket. Walks the `cause` chain, as the writer wraps some failures.
+ */
+const DRIVER_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EHOSTUNREACH',
+  'CONNECTION_CLOSED', 'CONNECTION_ENDED', 'CONNECTION_DESTROYED', 'CONNECT_TIMEOUT',
+]);
+// 08 connection exception, 53 insufficient resources, 58 system error; and
+// 57P01–57P03 (admin shutdown, crash shutdown, cannot connect now), 25P03
+// (idle-in-transaction timeout). A statement timeout (57014) is the ticket's.
+const INFRA_SQLSTATE_CLASSES: ReadonlySet<string> = new Set(['08', '53', '58']);
+const INFRA_SQLSTATES: ReadonlySet<string> = new Set(['57P01', '57P02', '57P03', '25P03']);
+const INFRA_ERROR_NAMES: ReadonlySet<string> = new Set(['SliceSupersededError', 'DbPoolAcquireAbortedError']);
+
+export function isInfrastructureError(error: unknown): boolean {
+  let cursor: unknown = error;
+  for (let depth = 0; depth < 4 && cursor !== null && typeof cursor === 'object'; depth += 1) {
+    const e = cursor as { code?: unknown; name?: unknown; cause?: unknown };
+    if (typeof e.name === 'string' && INFRA_ERROR_NAMES.has(e.name)) return true;
+    if (typeof e.code === 'string') {
+      if (DRIVER_ERROR_CODES.has(e.code)) return true;
+      if (/^[0-9A-Z]{5}$/.test(e.code) && (INFRA_SQLSTATES.has(e.code) || INFRA_SQLSTATE_CLASSES.has(e.code.slice(0, 2)))) return true;
+    }
+    cursor = e.cause;
+  }
+  return false;
+}
+
+/**
+ * The module contract on ids (§5.2): a conversion imports the ticket its row
+ * names. A ticket whose `sourceId` is not the row's key would be resumed and
+ * reported under another ticket's key, so it is refused visibly
+ * (`module_contract_violation`), and a module bug shows in its first dry run.
+ */
+export function conversionIdentityViolation(conversion: Conversion, rowKey: string): boolean {
+  return conversion.kind === 'ticket' && conversion.ticket.sourceId !== rowKey;
 }
