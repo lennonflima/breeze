@@ -35,6 +35,7 @@ import {
   isInfrastructureError,
   predictTicket,
   recordImportResult,
+  versionKey,
   type IssueTarget,
 } from './runOutcomes';
 import { IssueBuffer, normalizeCounters, type RunCounters, type RunIssue } from './runReport';
@@ -326,7 +327,10 @@ class SliceRunner {
     const rows = page.rows;
     const existing = await withDbAccessContext(runContext(this.input.partnerId), () =>
       readItems(this.input.partnerId, this.run.sourceId, rows.map((r) => r.key)));
-    const refs = await keysWithRef(this.principalId, rows.filter((r) => this.needsRefCheck(r, existing.get(r.key))).map((r) => r.key));
+    // One batched ref lookup per page (review #14): the changed items that ever
+    // had a ticket, and on a dry run every row (create or resume).
+    const refKeys = rows.filter((r) => this.dryRun || this.needsRefCheck(r, existing.get(r.key))).map((r) => r.key);
+    const refs = refKeys.length > 0 ? await keysWithRef(this.principalId, refKeys) : new Set<string>();
     // A key a source lists twice in one page is processed once, the first
     // time (review #8); keys of rows done before a crash count as handled.
     const handled = new Set(rows.slice(0, this.cursor.scan.index).map((r) => r.key));
@@ -359,7 +363,7 @@ class SliceRunner {
   private needsRefCheck(row: SourceRow, item: ItemRow | undefined): boolean {
     if (!item || (item.breezeTicketId === null && item.importedVersion === null)) return false;
     if (item.state === 'removed_in_breeze' || item.state === 'merged_in_breeze') return false;
-    return !(item.state === 'imported' && item.importedVersion === row.version);
+    return !(item.state === 'imported' && item.importedVersion === versionKey(row.version));
   }
 
   private resolveOrg(orgKey: string | null): string | null {
@@ -372,7 +376,7 @@ class SliceRunner {
 
   private async processRow(row: SourceRow, item: ItemRow | undefined, refs: Set<string> | null): Promise<RowResult> {
     const target: IssueTarget = { key: row.key, number: row.number ?? null };
-    const seen = { seenVersion: row.version.slice(0, 64), seenRunId: this.input.runId };
+    const seen = { seenVersion: versionKey(row.version), seenRunId: this.input.runId };
     // Already handled by this run (a page re-read after a crash or a shift).
     if (!this.dryRun && item && item.seenRunId === this.input.runId && item.seenVersion === seen.seenVersion) {
       return { kind: 'done', slow: false };
@@ -407,14 +411,14 @@ class SliceRunner {
         return { kind: 'done', slow: false };
       }
     }
-    return this.loadAndImport(row, item, orgId, target);
+    return this.loadAndImport(row, item, orgId, target, refs);
   }
 
   private itemOf(row: SourceRow, item: ItemRow | undefined, change: Partial<ItemWrite> & Pick<ItemWrite, 'state'>): ItemWrite {
     return {
       sourceTicketKey: row.key,
       importedVersion: item?.importedVersion ?? null,
-      seenVersion: row.version.slice(0, 64),
+      seenVersion: versionKey(row.version),
       seenRunId: this.input.runId,
       breezeTicketId: item?.breezeTicketId ?? null,
       pendingLinks: item?.pendingLinks ?? null,
@@ -465,7 +469,13 @@ class SliceRunner {
     return { kind: 'done', slow: true };
   }
 
-  private async loadAndImport(row: SourceRow, item: ItemRow | undefined, orgId: string, target: IssueTarget): Promise<RowResult> {
+  private async loadAndImport(
+    row: SourceRow,
+    item: ItemRow | undefined,
+    orgId: string,
+    target: IssueTarget,
+    refs: Set<string> | null,
+  ): Promise<RowResult> {
     // The quick decisions so far commit before the slow work.
     if (this.pending.length > 0) await this.commit();
     let loaded: LoadedTicket;
@@ -505,7 +515,7 @@ class SliceRunner {
     const ticket = { ...clamped.ticket, orgId };
     if (importedTicketBytes(ticket) > this.limits.maxTicketBytes) return this.failItem(row, item, issueTarget, 'ticket_too_large');
 
-    if (this.dryRun) return this.predict(row, item, ticket, conversion.links.length, issueTarget);
+    if (this.dryRun) return this.predict(row, item, ticket, conversion.links.length, issueTarget, refs);
 
     let result;
     this.attachmentSignal = null;
@@ -550,7 +560,7 @@ class SliceRunner {
     recordImportResult(result, this.counters, this.issues, issueTarget);
     // A ticket with links records its version once they are written or known
     // impossible (§6.6); with no link writer they stay the conversion's note.
-    let importedVersion: string | null = row.version.slice(0, 64);
+    let importedVersion: string | null = versionKey(row.version);
     let pendingLinks: PendingLink[] | null = null;
     if (conversion.links.length > 0) {
       if (this.deps.linkWriter) {
@@ -565,7 +575,14 @@ class SliceRunner {
     return { kind: 'done', slow: true };
   }
 
-  private async predict(row: SourceRow, item: ItemRow | undefined, ticket: ImportedTicket, links: number, target: IssueTarget): Promise<RowResult> {
+  private async predict(
+    row: SourceRow,
+    item: ItemRow | undefined,
+    ticket: ImportedTicket,
+    links: number,
+    target: IssueTarget,
+    refs: Set<string> | null,
+  ): Promise<RowResult> {
     try {
       parseImportedTicket(ticket, this.now());
     } catch (error) {
@@ -576,7 +593,7 @@ class SliceRunner {
       this.counters.predicted.invalid += 1;
       return this.failItem(row, item, target, error.code);
     }
-    const resumes = (await keysWithRef(this.principalId, [row.key])).has(row.key);
+    const resumes = (refs ?? await keysWithRef(this.principalId, [row.key])).has(row.key);
     predictTicket(ticket, this.counters, resumes);
     this.counters.linksAsNotes += links;
     return { kind: 'done', slow: true };
