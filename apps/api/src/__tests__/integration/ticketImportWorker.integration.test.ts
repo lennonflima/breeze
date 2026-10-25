@@ -49,7 +49,7 @@ import { ticketImportLimits } from '../../services/ticketImport/importLimits';
 import { importTicket } from '../../services/ticketImport/importWriter';
 import { registerTicketImportModule } from '../../services/ticketImport/moduleRegistry';
 import { normalizeCounters } from '../../services/ticketImport/runReport';
-import { SourceUnavailableError } from '../../services/ticketImport/sourceFetch';
+import { SourceAuthError, SourceUnavailableError } from '../../services/ticketImport/sourceFetch';
 import { clearFakeSources, fakeTicketImportModule } from '../../services/ticketImport/testing/fakeModule';
 import { upsertTicketExternalRef } from '../../services/ticketExternalRefs';
 import { mergeTickets } from '../../services/ticketMerge';
@@ -329,6 +329,77 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
       .toEqual(['deleted_in_source:d1', 'hidden_in_source:d2']);
     // Nothing is ever deleted in Breeze.
     expect((await importedTickets(fx)).filter((t) => t.deletedAt === null).length).toBe(4);
+  }, CASE_TIMEOUT);
+
+  runDb('a probe the source cannot answer now leaves the ticket imported and is retried by the next run (review #5)', async () => {
+    const fx = await seedImport();
+    fx.source.tickets = fakeTickets(['q1', 'q2']);
+    const window = await openWindow(fx);
+    const first = await startImportRun(fx, 'import', window.id);
+    await drive(fx, first.id);
+
+    fx.source.shifted.add('q1');
+    fx.source.failures.probe.set('q1', [new SourceUnavailableError('gateway timeout')]);
+    const second = await startImportRun(fx, 'import', window.id);
+    await drive(fx, second.id);
+    expect(await runRow(second.id)).toMatchObject({ state: 'completed' });
+    expect((await ledger(fx.sourceId)).get('q1')).toMatchObject({ state: 'imported', seenRunId: first.id });
+    expect(normalizeCounters((await runRow(second.id)).counters).tickets.failed).toBe(0);
+    expect((await issuesOf(second.id)).map((i) => [i.kind, i.sourceTicketKey, i.code])).toEqual([['probe_deferred', 'q1', 'source_unavailable']]);
+
+    // The next run probes it again; this time the source answers.
+    const third = await startImportRun(fx, 'import', window.id);
+    await drive(fx, third.id);
+    expect(fx.source.calls.probe.filter((k) => k === 'q1')).toHaveLength(2);
+    expect((await ledger(fx.sourceId)).get('q1')).toMatchObject({ state: 'imported', seenRunId: third.id });
+  }, CASE_TIMEOUT);
+
+  runDb('a source that answers Retry-After forever stops the run after 20 waits; a success resets the count (review #6)', async () => {
+    const fx = await seedImport();
+    fx.source.tickets = fakeTickets(['ra']);
+    fx.source.failures.scan = Array.from({ length: 25 }, () => new SourceUnavailableError('slow down', 5_000));
+    const window = await openWindow(fx);
+    const run = await startImportRun(fx, 'import', window.id);
+    const steps = await drive(fx, run.id);
+    expect(steps.filter((s) => s.outcome === 'delayed')).toHaveLength(19);
+    expect(await runRow(run.id)).toMatchObject({ state: 'stopped', stopReason: 'source_unavailable' });
+
+    const fx2 = await seedImport();
+    fx2.source.tickets = fakeTickets(['rb']);
+    fx2.source.failures.scan = Array.from({ length: 3 }, () => new SourceUnavailableError('slow down', 5_000));
+    const window2 = await openWindow(fx2);
+    const run2 = await startImportRun(fx2, 'import', window2.id);
+    const steps2 = await drive(fx2, run2.id);
+    expect(steps2.filter((s) => s.outcome === 'delayed')).toHaveLength(3);
+    const done = await runRow(run2.id);
+    expect(done.state).toBe('completed');
+    expect((done.cursor as { sourceFailures: number }).sourceFailures).toBe(0);
+  }, CASE_TIMEOUT);
+
+  runDb('a refused credential on a file stops the run; a file Retry-After defers the slice and the ticket resumes (review #7)', async () => {
+    const fx = await seedImport();
+    const withFile = (key: string) => fakeTickets([key], {
+      comments: [{ id: `${key}-1`, at: minutes(5), content: 'File', files: [{ id: `${key}f`, filename: 'a.png', bytes: new Uint8Array(PNG), declaredBytes: PNG.length }] }],
+    });
+    fx.source.tickets = withFile('u1');
+    fx.source.failures.file.set('file:u1f', [new SourceAuthError()]);
+    const window = await openWindow(fx);
+    const run = await startImportRun(fx, 'import', window.id);
+    await drive(fx, run.id);
+    expect(await runRow(run.id)).toMatchObject({ state: 'stopped', stopReason: 'source_unauthorized' });
+    const [begun] = await importedTickets(fx);
+    expect((await ledger(fx.sourceId)).get('u1')).toMatchObject({ state: 'failed', failureCode: 'incomplete', breezeTicketId: begun!.id });
+
+    const fx2 = await seedImport();
+    fx2.source.tickets = withFile('u2');
+    fx2.source.failures.file.set('file:u2f', [new SourceUnavailableError('wait', 30_000)]);
+    const window2 = await openWindow(fx2);
+    const run2 = await startImportRun(fx2, 'import', window2.id);
+    const steps = await drive(fx2, run2.id);
+    expect(steps.map((s) => s.outcome)).toEqual(['delayed', 'finished']);
+    expect(await runRow(run2.id)).toMatchObject({ state: 'completed' });
+    expect((await ledger(fx2.sourceId)).get('u2')).toMatchObject({ state: 'imported' });
+    expect(normalizeCounters((await runRow(run2.id)).counters)).toMatchObject({ tickets: { failed: 0, resumed: 1 }, attachments: { written: 1 } });
   }, CASE_TIMEOUT);
 
   runDb('merged_in_breeze and removed_in_breeze are final across passes', async () => {

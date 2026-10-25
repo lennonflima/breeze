@@ -38,7 +38,7 @@ import {
 } from './runOutcomes';
 import { IssueBuffer, normalizeCounters, type RunCounters } from './runReport';
 import { openSourceCredentials } from './sourceCredentials';
-import { SourceHttpError, SourceResponseTooLargeError, type SourceClient } from './sourceFetch';
+import { SourceAuthError, SourceHttpError, SourceResponseTooLargeError, SourceUnavailableError, type SourceClient } from './sourceFetch';
 import { buildSourceHandle } from './sourceHandle';
 import { readSourceForUse } from './sourceStore';
 import { readWindowDescriptor, type WindowDescriptor } from './windowLock';
@@ -144,6 +144,19 @@ class SliceRunner {
   private phase: TicketImportRunPhase;
   private pending: ItemWrite[] = [];
   private progressed = false;
+  /**
+   * Set by the attachment reader when a file's failure means more than that
+   * ticket (review #7): the credential was refused (stop the run), or the
+   * source asked to wait (defer the slice; the ticket resumes from the same
+   * cursor position). importTicket only sees a transient failure.
+   */
+  private attachmentSignal: { kind: 'stop'; reason: string } | { kind: 'defer'; delayMs: number } | null = null;
+
+  private takeAttachmentSignal(): { kind: 'stop'; reason: string } | { kind: 'defer'; delayMs: number } | null {
+    const signal = this.attachmentSignal;
+    this.attachmentSignal = null;
+    return signal;
+  }
   private module!: AnyTicketImportModule;
   private src!: SourceHandle;
   private maps!: SourceMaps;
@@ -471,6 +484,7 @@ class SliceRunner {
     if (this.dryRun) return this.predict(row, item, ticket, conversion.links.length, issueTarget);
 
     let result;
+    this.attachmentSignal = null;
     try {
       result = await (this.deps.importTicket ?? importTicket)(this.window!.id, ticket, {
         partnerId: this.input.partnerId,
@@ -480,6 +494,12 @@ class SliceRunner {
     } catch (error) {
       // The ticket the writer had when it failed, if any (review #2).
       const known = importErrorTicketId(error);
+      const signal = this.takeAttachmentSignal();
+      if (signal) {
+        this.rememberTicket(row, item, known);
+        if (signal.kind === 'stop') return { kind: 'stop', reason: signal.reason };
+        return this.sourceWait(signal.delayMs);
+      }
       const failure = classifyImportError(error);
       if (failure.kind === 'failed') return this.failItem(row, item, issueTarget, failure.code, known);
       if (failure.kind === 'stop') {
@@ -571,6 +591,10 @@ class SliceRunner {
           throw new ImportAttachmentFetchError('not_found', undefined, { cause: error });
         }
         if (error instanceof SourceResponseTooLargeError) throw new ImportAttachmentFetchError('too_large', undefined, { cause: error });
+        if (error instanceof SourceAuthError) this.attachmentSignal = { kind: 'stop', reason: 'source_unauthorized' };
+        else if (error instanceof SourceUnavailableError && error.retryAfterMs !== null) {
+          this.attachmentSignal = { kind: 'defer', delayMs: error.retryAfterMs };
+        }
         throw new ImportAttachmentFetchError('transient', undefined, { cause: error });
       }
     };
@@ -583,10 +607,22 @@ class SliceRunner {
     if (f.kind === 'http') return { kind: 'stop', reason: `source_${f.status}` };
     if (f.kind === 'too_large') return { kind: 'stop', reason: 'source_page_too_large' };
     if (f.kind === 'rethrow') throw error;
-    if (f.retryAfterMs !== null) return { kind: 'defer', delayMs: f.retryAfterMs, reason: 'source_retry_after' };
+    if (f.retryAfterMs !== null) return this.sourceWait(f.retryAfterMs);
     this.cursor.sourceFailures += 1;
     if (this.cursor.sourceFailures >= SOURCE_FAILURE_LIMIT) return { kind: 'stop', reason: 'source_unavailable' };
     return { kind: 'defer', delayMs: sourceBackoffMs(this.cursor.sourceFailures), reason: 'source_unavailable' };
+  }
+
+  /**
+   * The source asked to wait (`Retry-After`). It counts as a consecutive
+   * source failure (review #6), saved in the cursor across slices and reset
+   * by the next success, so a source that answers 429 forever stops the run
+   * as `source_unavailable` instead of deferring it forever.
+   */
+  private sourceWait(delayMs: number): Exclude<EndStep, { kind: 'yield' }> {
+    this.cursor.sourceFailures += 1;
+    if (this.cursor.sourceFailures >= SOURCE_FAILURE_LIMIT) return { kind: 'stop', reason: 'source_unavailable' };
+    return { kind: 'defer', delayMs, reason: 'source_retry_after' };
   }
 
   /** A failed load or probe of one ticket: the ticket fails, unless the source asked to wait or is gone. */
@@ -601,10 +637,39 @@ class SliceRunner {
     }
     if (f.kind === 'http') return this.failItem(row, item, target, `source_${f.status}`);
     if (f.kind === 'too_large') return this.failItem(row, item, target, 'ticket_too_large');
-    if (f.retryAfterMs !== null) return { kind: 'defer', delayMs: f.retryAfterMs, reason: 'source_retry_after' };
+    if (f.retryAfterMs !== null) return this.sourceWait(f.retryAfterMs);
     this.cursor.sourceFailures += 1;
     if (this.cursor.sourceFailures >= SOURCE_FAILURE_LIMIT) return { kind: 'stop', reason: 'source_unavailable' };
     return this.failItem(row, item, target, 'source_unavailable');
+  }
+
+  /**
+   * A probe the source could not answer (review #5). Never a failed ticket:
+   * the item was imported and stays so, unseen by this run, with a
+   * `probe_deferred` issue, and the next run probes it again. A refused
+   * credential stops the run; a `Retry-After` defers the slice; both, and a
+   * transient failure, count toward the consecutive source failures.
+   */
+  private probeTrouble(error: unknown, target: IssueTarget): Exclude<EndStep, { kind: 'yield' }> | null {
+    const f = classifySourceError(error);
+    let code: string;
+    if (f.kind === 'unauthorized') return { kind: 'stop', reason: 'source_unauthorized' };
+    if (f.kind === 'unavailable') {
+      if (f.retryAfterMs !== null) return this.sourceWait(f.retryAfterMs);
+      this.cursor.sourceFailures += 1;
+      if (this.cursor.sourceFailures >= SOURCE_FAILURE_LIMIT) return { kind: 'stop', reason: 'source_unavailable' };
+      code = 'source_unavailable';
+    } else if (f.kind === 'http') {
+      code = `source_${f.status}`;
+    } else if (f.kind === 'too_large') {
+      code = 'response_too_large';
+    } else {
+      if (isInfrastructureError(error)) throw error;
+      this.reportTicketFault(error, target.key, 'probe');
+      code = 'internal_error';
+    }
+    this.issues.add({ sourceTicketKey: target.key, sourceTicketNumber: null, kind: 'probe_deferred', code });
+    return null;
   }
 
   // ------------------------------------------------------------- links
@@ -663,9 +728,9 @@ class SliceRunner {
       try {
         probe = await this.module.probe(this.src, item.sourceTicketKey);
       } catch (error) {
-        const pseudoRow: SourceRow = { key: item.sourceTicketKey, version: item.seenVersion ?? '', orgKey: null, summary: null };
-        const result = this.ticketSourceTrouble(error, pseudoRow, item, target);
-        if (result.kind !== 'done') return result;
+        const outcome = this.probeTrouble(error, target);
+        if (outcome) return outcome;
+        // The item stays imported and unseen: the next run probes it again.
         this.cursor.deletions.after = item.sourceTicketKey;
         await this.commit();
         this.progressed = true;
