@@ -18,6 +18,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 
 const s3 = vi.hoisted(() => ({ configured: true, objects: new Map<string, Buffer>() }));
+const refLookups = vi.hoisted(() => ({ calls: [] as Array<{ principalId: string; keys: string[] }> }));
 
 vi.mock('../../services/s3Storage', async (orig) => ({
   ...(await orig<typeof import('../../services/s3Storage')>()),
@@ -25,6 +26,16 @@ vi.mock('../../services/s3Storage', async (orig) => ({
   putObjectBuffer: async (key: string, body: Buffer) => { s3.objects.set(key, Buffer.from(body)); },
   deleteObjects: async (keys: readonly string[]) => { for (const key of keys) s3.objects.delete(key); },
 }));
+vi.mock('../../services/ticketImport/conversionLookups', async (orig) => {
+  const actual = await orig<typeof import('../../services/ticketImport/conversionLookups')>();
+  return {
+    ...actual,
+    keysWithRef: async (principalId: string, keys: readonly string[]) => {
+      refLookups.calls.push({ principalId, keys: [...keys] });
+      return actual.keysWithRef(principalId, keys);
+    },
+  };
+});
 vi.mock('../../services/ticketEvents', async (orig) => {
   const actual = await orig<typeof import('../../services/ticketEvents')>();
   const record = async () => undefined;
@@ -745,6 +756,41 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     expect(await getTestDb().select().from(ticketImportItems).where(eq(ticketImportItems.sourceId, fx.sourceId))).toEqual([]);
     expect(await getTestDb().select().from(migrationWindows).where(eq(migrationWindows.partnerId, fx.partner.id))).toEqual(windowsBefore);
     expect(s3.objects.size).toBe(0);
+  }, CASE_TIMEOUT);
+
+  runDb('a dry run looks refs up once per page, not once per ticket (review #14)', async () => {
+    const fx = await seedImport();
+    fx.source.pageSize = 5;
+    fx.source.tickets = fakeTickets(['p1', 'p2', 'p3', 'p4', 'p5']);
+    refLookups.calls = [];
+    const run = await startImportRun(fx, 'dry_run');
+    await drive(fx, run.id);
+    const mine = refLookups.calls.filter((c) => c.principalId === fx.principal.id);
+    expect(mine).toEqual([{ principalId: fx.principal.id, keys: ['p1', 'p2', 'p3', 'p4', 'p5'] }]);
+    expect(normalizeCounters((await runRow(run.id)).counters).predicted.creates).toBe(5);
+  }, CASE_TIMEOUT);
+
+  runDb('versions longer than 64 characters are compared whole (review #15)', async () => {
+    const fx = await seedImport();
+    const prefix = 'x'.repeat(64);
+    fx.source.tickets = fakeTickets(['long'], { version: `${prefix}${'a'.repeat(36)}` });
+    const window = await openWindow(fx);
+    await drive(fx, (await startImportRun(fx, 'import', window.id)).id);
+    const stored = (await ledger(fx.sourceId)).get('long')!;
+    expect(stored.importedVersion).toMatch(/^sha256:/);
+    expect(stored.importedVersion).toHaveLength(64);
+
+    // Unchanged: not loaded again.
+    fx.source.calls.load = [];
+    await drive(fx, (await startImportRun(fx, 'import', window.id)).id);
+    expect(fx.source.calls.load).toEqual([]);
+
+    // Changed past the 64th character: loaded again, which truncation would have missed.
+    fx.source.tickets[0]!.version = `${prefix}${'b'.repeat(36)}`;
+    const third = await startImportRun(fx, 'import', window.id);
+    await drive(fx, third.id);
+    expect(fx.source.calls.load).toEqual(['long']);
+    expect(normalizeCounters((await runRow(third.id)).counters).tickets.resumed).toBe(1);
   }, CASE_TIMEOUT);
 
   runDb('a revoked source stops its run as credentials_revoked', async () => {

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { MigrationWindowError } from '../migrationWindows';
 import { TicketServiceError } from '../ticketService';
 import { IMPORT_ATTACHMENT_MAX_BYTES } from './importAttachments';
@@ -261,4 +262,18 @@ export function isInfrastructureError(error: unknown): boolean {
  */
 export function conversionIdentityViolation(conversion: Conversion, rowKey: string): boolean {
   return conversion.kind === 'ticket' && conversion.ticket.sourceId !== rowKey;
+}
+
+/**
+ * The one stored and compared form of a source version (review #15): the
+ * version itself up to 64 characters (the ledger's varchar(64)); a longer one
+ * becomes `sha256:` and 57 hex characters of its digest, a fixed 64. Applied
+ * wherever a version is stored or compared, so two long versions that share
+ * their first 64 characters never read as the same.
+ */
+export const VERSION_KEY_MAX = 64;
+
+export function versionKey(version: string): string {
+  if (version.length <= VERSION_KEY_MAX) return version;
+  return `sha256:${createHash('sha256').update(version).digest('hex').slice(0, VERSION_KEY_MAX - 'sha256:'.length)}`;
 }

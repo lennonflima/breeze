@@ -15,6 +15,7 @@ import {
   isInfrastructureError,
   predictTicket,
   recordImportResult,
+  versionKey,
 } from './runOutcomes';
 import { emptyCounters, IssueBuffer, normalizeCounters, type RunIssue } from './runReport';
 import { SourceAuthError, SourceHttpError, SourceResponseTooLargeError, SourceUnavailableError } from './sourceFetch';
@@ -239,5 +240,24 @@ describe('isInfrastructureError and the conversion identity (review #1, #3)', ()
     expect(conversionIdentityViolation({ kind: 'ticket', ticket: ticket({ sourceId: '41' }), ...base }, '41')).toBe(false);
     expect(conversionIdentityViolation({ kind: 'ticket', ticket: ticket({ sourceId: '42' }), ...base }, '41')).toBe(true);
     expect(conversionIdentityViolation({ kind: 'skip', code: 'unsupported', notes: [] }, '41')).toBe(false);
+  });
+});
+
+describe('versionKey (review #15)', () => {
+  it('keeps a version up to 64 characters as it is', () => {
+    expect(versionKey('2024-03-01T10:00:00.000Z')).toBe('2024-03-01T10:00:00.000Z');
+    expect(versionKey('x'.repeat(64))).toBe('x'.repeat(64));
+  });
+
+  it('gives a 100-character version a fixed 64-character digest that tells it from its neighbours', () => {
+    const a = `${'x'.repeat(64)}${'a'.repeat(36)}`;
+    const b = `${'x'.repeat(64)}${'b'.repeat(36)}`;
+    expect(a).toHaveLength(100);
+    expect(versionKey(a)).toHaveLength(64);
+    expect(versionKey(a)).toMatch(/^sha256:[0-9a-f]{57}$/);
+    expect(versionKey(a)).toBe(versionKey(a));
+    // Truncation would have made these equal.
+    expect(a.slice(0, 64)).toBe(b.slice(0, 64));
+    expect(versionKey(a)).not.toBe(versionKey(b));
   });
 });
