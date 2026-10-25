@@ -4,8 +4,7 @@ import { IMPORT_ATTACHMENT_MAX_BYTES } from './importAttachments';
 import type { ImportedTicket } from './importedTicket';
 import type { ImportTicketResult } from './importWriter';
 import type { Conversion, ReportNote } from './moduleContract';
-import { rememberOwner, type RunCursor } from './runCursor';
-import type { IssueBuffer, RunCounters } from './runReport';
+import type { IssueBuffer, RunCounters, RunIssue } from './runReport';
 import { SourceAuthError, SourceHttpError, SourceResponseTooLargeError, SourceUnavailableError } from './sourceFetch';
 
 /**
@@ -56,21 +55,24 @@ export function importedTicketBytes(ticket: ImportedTicket): number {
 
 export type IssueTarget = { key: string; number: string | null };
 
-/** A conversion's notes into counters and, where the report lists one, issues (§5.10). */
+/**
+ * A conversion's notes into counters and, where the report lists one, issues
+ * (§5.10). An unmatched owner goes to `owners`: its row is written with the
+ * next commit against a unique index, once per distinct owner per run, and
+ * `ownersUnmatched` counts the rows that index let in (review #13). Owner
+ * rows are bounded by the source's owners, so the issue cap does not apply.
+ */
 export function applyNotes(
   notes: readonly ReportNote[],
   counters: RunCounters,
   issues: IssueBuffer,
-  cursor: RunCursor,
+  owners: RunIssue[],
   target: IssueTarget,
 ): void {
   for (const note of notes) {
     switch (note.kind) {
       case 'owner_unmatched':
-        if (rememberOwner(cursor, note.sourceUserKey)) {
-          counters.ownersUnmatched += 1;
-          issues.add({ sourceTicketKey: target.key, sourceTicketNumber: target.number, kind: 'owner_unmatched', code: note.sourceUserKey.slice(0, 64) });
-        }
+        owners.push({ sourceTicketKey: target.key, sourceTicketNumber: target.number, kind: 'owner_unmatched', code: note.sourceUserKey.slice(0, 64), count: 1 });
         break;
       case 'requester_without_contact':
         counters.requestersWithoutContact += 1;

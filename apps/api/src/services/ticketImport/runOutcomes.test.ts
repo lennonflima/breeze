@@ -4,7 +4,7 @@ import { TicketServiceError } from '../ticketService';
 import type { ImportedTicket } from './importedTicket';
 import type { ImportTicketResult } from './importWriter';
 import { ticketImportLimits } from './importLimits';
-import { normalizeCursor, rememberOwner } from './runCursor';
+import { normalizeCursor } from './runCursor';
 import {
   applyNotes,
   clampTicketTimes,
@@ -16,7 +16,7 @@ import {
   predictTicket,
   recordImportResult,
 } from './runOutcomes';
-import { emptyCounters, IssueBuffer, normalizeCounters } from './runReport';
+import { emptyCounters, IssueBuffer, normalizeCounters, type RunIssue } from './runReport';
 import { SourceAuthError, SourceHttpError, SourceResponseTooLargeError, SourceUnavailableError } from './sourceFetch';
 
 const NOW = new Date('2026-10-25T12:00:00.000Z');
@@ -83,10 +83,10 @@ describe('importedTicketBytes', () => {
 });
 
 describe('applyNotes and recordImportResult (spec §5.10)', () => {
-  it('reports an unmatched owner once per run, and counts the rest', () => {
+  it('hands unmatched owners to the commit (deduplicated there), and counts the rest', () => {
     const counters = emptyCounters();
     const issues = new IssueBuffer(counters, 100);
-    const cursor = normalizeCursor({});
+    const owners: RunIssue[] = [];
     const target = { key: 'k', number: '#1' };
     applyNotes([
       { kind: 'owner_unmatched', sourceUserKey: '42' },
@@ -96,11 +96,13 @@ describe('applyNotes and recordImportResult (spec §5.10)', () => {
       { kind: 'comments_system_skipped', count: 3 },
       { kind: 'attachments_alternative_ignored', count: 1 },
       { kind: 'custom_attribute', name: 'customer_tier' },
-    ], counters, issues, cursor, target);
-    expect(counters).toMatchObject({ ownersUnmatched: 1, requestersWithoutContact: 1, contentTruncated: 2, customAttributes: { customer_tier: 1 } });
+    ], counters, issues, owners, target);
+    // ownersUnmatched counts the rows the unique index lets in, at commit.
+    expect(counters).toMatchObject({ ownersUnmatched: 0, requestersWithoutContact: 1, contentTruncated: 2, customAttributes: { customer_tier: 1 } });
+    expect(owners.map((o) => [o.kind, o.code, o.sourceTicketKey])).toEqual([['owner_unmatched', '42', 'k'], ['owner_unmatched', '42', 'k']]);
     expect(counters.comments.systemSkipped).toBe(3);
     expect(counters.attachments.alternativesIgnored).toBe(1);
-    expect(issues.take().map((i) => [i.kind, i.code, i.count])).toEqual([['owner_unmatched', '42', 1], ['content_truncated', null, 2]]);
+    expect(issues.take().map((i) => [i.kind, i.code, i.count])).toEqual([['content_truncated', null, 2]]);
   });
 
   it('turns a result into counters and lists what v1 only reports, made-internal comments flagged', () => {
@@ -196,10 +198,9 @@ describe('the stored run state', () => {
     expect(normalizeCounters({ tickets: { created: 3, bogus: 1 }, customAttributes: { a: 2, b: -1 }, linksWritten: 'x' }))
       .toMatchObject({ tickets: { created: 3, seen: 0 }, customAttributes: { a: 2, b: 0 }, linksWritten: 0 });
     expect(normalizeCursor(null)).toMatchObject({ scan: { page: null, index: 0, done: false }, sourceFailures: 0, clockSkewMs: undefined });
-    const cursor = normalizeCursor({ scan: { page: 3, index: 2 }, clockSkewMs: null, ownersSeen: ['a', 7] });
-    expect(cursor).toMatchObject({ scan: { page: 3, index: 2, done: false }, clockSkewMs: null, ownersSeen: ['a'] });
-    expect(rememberOwner(cursor, 'a')).toBe(false);
-    expect(rememberOwner(cursor, 'b')).toBe(true);
+    // Positions and counts only (review #13): an old cursor's lists are dropped.
+    const cursor = normalizeCursor({ scan: { page: 3, index: 2 }, clockSkewMs: null, ownersSeen: ['a'], links: { queue: [1], index: 4, after: 'k9' } });
+    expect(cursor).toEqual({ scan: { page: 3, index: 2, done: false }, links: { after: 'k9' }, deletions: { after: null }, sourceFailures: 0, clockSkewMs: null });
   });
 
   it('keeps the global lease cap below the worker concurrency', () => {

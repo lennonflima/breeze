@@ -20,7 +20,8 @@ import { users } from './users';
  * Partial indexes not modeled here: ticket_import_org_maps_source_key_uq and
  * ticket_import_org_maps_fallback_uq (one row per source org, at most one
  * fallback), ticket_import_runs_one_active_per_source (one queued or running
- * run per source) and ticket_import_runs_window_idx.
+ * run per source), ticket_import_runs_window_idx and
+ * ticket_import_run_issues_owner_uq (one owner_unmatched row per owner per run).
  */
 
 export const TICKET_IMPORT_RUN_KINDS = ['dry_run', 'import'] as const;
@@ -43,6 +44,9 @@ export const TICKET_IMPORT_ITEM_STATES = [
   'merged_in_breeze',
 ] as const;
 export type TicketImportItemState = (typeof TICKET_IMPORT_ITEM_STATES)[number];
+
+/** A link a conversion asked for, waiting on its item for the links phase. */
+export type PendingLink = { targetKey: string; linkType: 'duplicate_of' | 'related' | 'caused_by' | 'resolves'; at: string };
 
 /**
  * A connected source: one per keyless import principal (resume is per
@@ -208,6 +212,8 @@ export const ticketImportItems = pgTable('ticket_import_items', {
   seenRunId: uuid('seen_run_id'),
   // FK-less: the Breeze ticket this item imported into, or began to.
   breezeTicketId: uuid('breeze_ticket_id'),
+  // Links waiting for the links phase (spec §6.6); NULL when none wait.
+  pendingLinks: jsonb('pending_links').$type<PendingLink[]>(),
   failureCode: varchar('failure_code', { length: 64 }),
   // Failed attempts since the last success.
   attempts: integer('attempts').notNull().default(0),

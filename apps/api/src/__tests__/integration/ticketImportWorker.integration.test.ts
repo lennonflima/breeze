@@ -126,9 +126,12 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     expect(imported.find((t) => t.key === 't1')!.assignedTo).toBe(fx.agent.id);
     const items = await ledger(fx.sourceId);
     expect([...items.values()].every((i) => i.state === 'imported' && i.importedVersion === 'v1' && i.seenRunId === run.id)).toBe(true);
-    // The unmatched owner is listed once, with the source user key as code.
+    // The unmatched owner is listed once, with the source user key as code,
+    // although t2 and t3 were imported by different slices (review #13).
     const owners = (await issuesOf(run.id)).filter((i) => i.kind === 'owner_unmatched');
     expect(owners.map((i) => i.code)).toEqual(['gone@former.example']);
+    // The cursor holds positions and counts only.
+    expect(Object.keys(row.cursor).sort()).toEqual(['clockSkewMs', 'deletions', 'links', 'scan', 'sourceFailures']);
 
     // A second pass over an unchanged source loads nothing.
     fx.source.calls.load = [];
@@ -422,7 +425,7 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     const ctx = runContext(fx.partner.id);
     const token = await withDbAccessContext(ctx, () => claimSlice(fx.partner.id, next.id, 0));
     expect(token).not.toBeNull();
-    const base = { importedVersion: null, seenVersion: 'v9', seenRunId: next.id, breezeTicketId: null, failureCode: null, attempts: 0 };
+    const base = { importedVersion: null, seenVersion: 'v9', seenRunId: next.id, breezeTicketId: null, pendingLinks: null, failureCode: null, attempts: 0 };
     await withDbAccessContext(ctx, () => commitSlice(fx.partner.id, next.id, 0, token!, {
       sourceId: fx.sourceId, phase: 'scan', cursor: {}, counters: {},
       items: [{ ...base, sourceTicketKey: 'dup', state: 'failed' }, { ...base, sourceTicketKey: 'dup', state: 'skipped' }],
@@ -526,6 +529,36 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
     const t = normalizeCounters((await runRow(run2.id)).counters).tickets;
     expect(t.seen).toBe(3);
     expect(t.created + t.resumed + t.failed).toBe(3);
+  }, CASE_TIMEOUT);
+
+  runDb('links wait on their items for the links phase, never in the cursor (review #13)', async () => {
+    const fx = await seedImport();
+    const at = minutes(40);
+    fx.source.tickets = [
+      ...fakeTickets(['m1'], { links: [{ targetKey: 'sv', linkType: 'duplicate_of', at }] }),
+      ...fakeTickets(['m2'], { links: [{ targetKey: 'gone', linkType: 'duplicate_of', at }] }),
+      ...fakeTickets(['sv']),
+    ];
+    const written: string[] = [];
+    const linkWriter = {
+      async writeLink(_windowId: string, link: { sourceKey: string; targetKey: string }) {
+        written.push(`${link.sourceKey}->${link.targetKey}`);
+        // The survivor of m2 was never imported: worth another try next pass.
+        return link.targetKey === 'gone' ? { outcome: 'not_written' as const, code: 'target_missing', retry: true } : { outcome: 'written' as const };
+      },
+    };
+    const window = await openWindow(fx);
+    const run = await startImportRun(fx, 'import', window.id);
+    await drive(fx, run.id, { deps: { ...oneTicketPerSlice, sliceDeps: { ...oneTicketPerSlice.sliceDeps, linkWriter } } });
+    expect(await runRow(run.id)).toMatchObject({ state: 'completed' });
+    expect(written.sort()).toEqual(['m1->sv', 'm2->gone']);
+    const items = await ledger(fx.sourceId);
+    // m1: its link is written, so its version is complete; m2 is reloaded next pass.
+    expect(items.get('m1')).toMatchObject({ state: 'imported', importedVersion: 'v1', pendingLinks: null });
+    expect(items.get('m2')).toMatchObject({ state: 'imported', importedVersion: null, pendingLinks: null });
+    expect(normalizeCounters((await runRow(run.id)).counters)).toMatchObject({ linksWritten: 1, linksAsNotes: 1 });
+    expect((await issuesOf(run.id)).filter((i) => i.kind === 'link_not_written').map((i) => [i.sourceTicketKey, i.code])).toEqual([['m2', 'target_missing']]);
+    expect(JSON.stringify((await runRow(run.id)).cursor)).not.toContain('sv');
   }, CASE_TIMEOUT);
 
   runDb('merged_in_breeze and removed_in_breeze are final across passes', async () => {
