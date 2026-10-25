@@ -140,6 +140,7 @@ class SliceRunner {
   private readonly dryRun: boolean;
   private phase: TicketImportRunPhase;
   private pending: ItemWrite[] = [];
+  private progressed = false;
   private module!: AnyTicketImportModule;
   private src!: SourceHandle;
   private maps!: SourceMaps;
@@ -225,8 +226,14 @@ class SliceRunner {
 
   // ----------------------------------------------------------- commits
 
+  /**
+   * The slice's budget is spent (it always does one unit of work first, so a
+   * run advances whatever the budget), or the lease was lost or the process
+   * is stopping (then it hands over at once).
+   */
   private timeUp(): boolean {
-    return this.now().getTime() - this.startedAt >= this.limits.sliceMs || (this.deps.shouldYield?.() ?? false);
+    if (this.deps.shouldYield?.()) return true;
+    return this.progressed && this.now().getTime() - this.startedAt >= this.limits.sliceMs;
   }
 
   private stage(item: ItemWrite): void {
@@ -296,7 +303,9 @@ class SliceRunner {
       if (result.kind !== 'done') return result;
       this.cursor.scan.index = i + 1;
       if (result.slow) await this.commit();
+      this.progressed = true;
     }
+    this.progressed = true;
     this.cursor.scan = { page: page.next, index: 0, done: page.next === null };
     if (this.cursor.scan.done) {
       this.phase = this.dryRun ? 'done' : this.cursor.links.queue.length > 0 && this.deps.linkWriter ? 'links' : 'deletions';
@@ -562,6 +571,7 @@ class SliceRunner {
       }
       this.cursor.links.index += 1;
       await this.commit();
+      this.progressed = true;
     }
     this.phase = 'deletions';
     await this.commit();
@@ -589,6 +599,7 @@ class SliceRunner {
         if (result.kind !== 'done') return result;
         this.cursor.deletions.after = item.sourceTicketKey;
         await this.commit();
+        this.progressed = true;
         continue;
       }
       this.cursor.sourceFailures = 0;
@@ -606,6 +617,7 @@ class SliceRunner {
       }
       this.cursor.deletions.after = item.sourceTicketKey;
       await this.commit();
+      this.progressed = true;
     }
     return { kind: 'progress' };
   }
