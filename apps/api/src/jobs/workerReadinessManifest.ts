@@ -119,6 +119,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('quoteSendWorker'),
   consumers('enrollmentKeyCleanup'),
   consumers('migrationWindowSweep'),
+  consumers('ticketImportWorker'),
   consumers('partnerApiIdempotencyRetention'),
   consumers('quickSupportReaper'),
   consumers('wispGrantReconciler'),
