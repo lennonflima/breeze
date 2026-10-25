@@ -101,6 +101,8 @@ export type ItemRow = {
   importedVersion: string | null;
   seenVersion: string | null;
   seenRunId: string | null;
+  /** The Breeze ticket this item imported into, or began to (FK-less). */
+  breezeTicketId: string | null;
   failureCode: string | null;
   attempts: number;
 };
@@ -114,6 +116,7 @@ const itemColumns = {
   importedVersion: ticketImportItems.importedVersion,
   seenVersion: ticketImportItems.seenVersion,
   seenRunId: ticketImportItems.seenRunId,
+  breezeTicketId: ticketImportItems.breezeTicketId,
   failureCode: ticketImportItems.failureCode,
   attempts: ticketImportItems.attempts,
 };
@@ -236,6 +239,7 @@ export async function commitSlice(partnerId: string, runId: string, seq: number,
           importedVersion: sql`excluded.imported_version`,
           seenVersion: sql`excluded.seen_version`,
           seenRunId: sql`excluded.seen_run_id`,
+          breezeTicketId: sql`excluded.breeze_ticket_id`,
           failureCode: sql`excluded.failure_code`,
           attempts: sql`excluded.attempts`,
           updatedAt: sql`excluded.updated_at`,

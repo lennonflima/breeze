@@ -5,7 +5,7 @@ import { captureException } from '../sentry';
 import { MigrationWindowError } from '../migrationWindows';
 import { parseImportedTicket, type ImportedTicket } from './importedTicket';
 import { ticketImportLimits, type TicketImportLimits } from './importLimits';
-import { ImportAttachmentFetchError, importTicket, type FetchImportAttachment } from './importWriter';
+import { ImportAttachmentFetchError, importErrorTicketId, importTicket, type FetchImportAttachment } from './importWriter';
 import { contactLookupContext, eligibleUsersByEmail, keysWithRef, singleContactsByEmail } from './conversionLookups';
 import type { AnyTicketImportModule, ConversionContext, ImportedLink, LoadedTicket, SourceHandle, SourceRow } from './moduleContract';
 import { getTicketImportModule } from './moduleRegistry';
@@ -317,9 +317,12 @@ class SliceRunner {
     return { kind: 'progress' };
   }
 
-  /** A changed item this principal imported before: does its ref still exist? (§5.9) */
+  /**
+   * A changed item that ever had a Breeze ticket (imported, or begun and then
+   * failed): does this principal's ref still exist? (§5.9, review #2)
+   */
   private needsRefCheck(row: SourceRow, item: ItemRow | undefined): boolean {
-    if (!item || item.importedVersion === null) return false;
+    if (!item || (item.breezeTicketId === null && item.importedVersion === null)) return false;
     if (item.state === 'removed_in_breeze' || item.state === 'merged_in_breeze') return false;
     return !(item.state === 'imported' && item.importedVersion === row.version);
   }
@@ -378,10 +381,33 @@ class SliceRunner {
       importedVersion: item?.importedVersion ?? null,
       seenVersion: row.version.slice(0, 64),
       seenRunId: this.input.runId,
+      breezeTicketId: item?.breezeTicketId ?? null,
       failureCode: null,
       attempts: item?.attempts ?? 0,
       ...change,
     };
+  }
+
+  /**
+   * Records the Breeze ticket of a ticket the writer began but did not finish
+   * (a stop or a deferral mid-ticket), leaving the rest of the item as it was,
+   * so a later pass knows the ticket existed even if it is deleted meanwhile.
+   */
+  private rememberTicket(row: SourceRow, item: ItemRow | undefined, ticketId: string | null): void {
+    if (!ticketId) return;
+    this.stage({
+      ...(item ?? {
+        sourceTicketKey: row.key,
+        state: 'failed',
+        importedVersion: null,
+        seenVersion: null,
+        seenRunId: null,
+        failureCode: 'incomplete',
+        attempts: 0,
+        breezeTicketId: null,
+      }),
+      breezeTicketId: ticketId,
+    });
   }
 
   /** An unexpected error confined to one ticket: logged and reported, never rethrown. */
@@ -390,10 +416,15 @@ class SliceRunner {
     captureException(error, undefined, { service: 'ticketImport', stage });
   }
 
-  private failItem(row: SourceRow, item: ItemRow | undefined, target: IssueTarget, code: string): RowResult {
+  private failItem(row: SourceRow, item: ItemRow | undefined, target: IssueTarget, code: string, ticketId: string | null = null): RowResult {
     this.counters.tickets.failed += 1;
     this.issues.add({ sourceTicketKey: target.key, sourceTicketNumber: target.number, kind: 'failed', code: code.slice(0, 64) });
-    this.stage(this.itemOf(row, item, { state: 'failed', failureCode: code.slice(0, 64), attempts: (item?.attempts ?? 0) + 1 }));
+    this.stage(this.itemOf(row, item, {
+      state: 'failed',
+      failureCode: code.slice(0, 64),
+      attempts: (item?.attempts ?? 0) + 1,
+      breezeTicketId: ticketId ?? item?.breezeTicketId ?? null,
+    }));
     return { kind: 'done', slow: true };
   }
 
@@ -447,21 +478,29 @@ class SliceRunner {
         fetchAttachment: this.attachmentFetcher(row.key),
       });
     } catch (error) {
+      // The ticket the writer had when it failed, if any (review #2).
+      const known = importErrorTicketId(error);
       const failure = classifyImportError(error);
-      if (failure.kind === 'failed') return this.failItem(row, item, issueTarget, failure.code);
-      if (failure.kind === 'stop') return { kind: 'stop', reason: failure.reason };
-      if (failure.kind === 'defer') return { kind: 'defer', delayMs: failure.delayMs, reason: 'window_rate_limited' };
+      if (failure.kind === 'failed') return this.failItem(row, item, issueTarget, failure.code, known);
+      if (failure.kind === 'stop') {
+        this.rememberTicket(row, item, known);
+        return { kind: 'stop', reason: failure.reason };
+      }
+      if (failure.kind === 'defer') {
+        this.rememberTicket(row, item, known);
+        return { kind: 'defer', delayMs: failure.delayMs, reason: 'window_rate_limited' };
+      }
       // Anything else is this ticket's alone (review #1), unless Breeze's own
       // infrastructure failed: then the slice ends and is retried.
       if (isInfrastructureError(error)) throw error;
       this.reportTicketFault(error, row.key, 'import');
-      return this.failItem(row, item, issueTarget, 'internal_error');
+      return this.failItem(row, item, issueTarget, 'internal_error', known);
     }
     if (result.outcome === 'skipped' && result.skip?.reason === 'merged_in_breeze') {
       this.counters.mergedInBreeze += 1;
       this.counters.tickets.skipped += 1;
       this.issues.add({ sourceTicketKey: issueTarget.key, sourceTicketNumber: issueTarget.number, kind: 'merged_in_breeze', code: result.skip.mergedIntoTicketId });
-      this.stage(this.itemOf(row, item, { state: 'merged_in_breeze', attempts: 0 }));
+      this.stage(this.itemOf(row, item, { state: 'merged_in_breeze', attempts: 0, breezeTicketId: result.ticketId }));
       return { kind: 'done', slow: true };
     }
     recordImportResult(result, this.counters, this.issues, issueTarget);
@@ -478,7 +517,7 @@ class SliceRunner {
         this.counters.linksAsNotes += conversion.links.length;
       }
     }
-    this.stage(this.itemOf(row, item, { state: 'imported', importedVersion, attempts: 0 }));
+    this.stage(this.itemOf(row, item, { state: 'imported', importedVersion, attempts: 0, breezeTicketId: result.ticketId }));
     return { kind: 'done', slow: true };
   }
 

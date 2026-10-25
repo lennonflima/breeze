@@ -387,13 +387,64 @@ describe('ticket import worker (fake module, real Postgres and Redis)', () => {
 
     const second = await startImportRun(fx, 'import', window.id);
     await drive(fx, second.id);
-    expect((await ledger(fx.sourceId)).get('f1')).toMatchObject({ state: 'imported', failureCode: null, attempts: 0 });
     const [ticket] = await importedTickets(fx);
+    expect((await ledger(fx.sourceId)).get('f1')).toMatchObject({ state: 'imported', failureCode: null, attempts: 0, breezeTicketId: ticket!.id });
     const files = await getTestDb().select().from(ticketAttachments).where(eq(ticketAttachments.ticketId, ticket!.id));
     expect(files).toHaveLength(1);
     expect(files[0]).toMatchObject({ importSourceId: 'file:img', contentType: 'image/png' });
     expect(files[0]!.commentId).not.toBeNull();
     expect(normalizeCounters((await runRow(second.id)).counters).attachments).toMatchObject({ written: 1, bytes: PNG.length });
+  }, CASE_TIMEOUT);
+
+  runDb('a ticket begun and then failed is never recreated once a technician deletes it (review #2)', async () => {
+    const fx = await seedImport();
+    fx.source.tickets = fakeTickets(['h1'], {
+      comments: [{ id: 'h1-1', at: minutes(5), content: 'With a file', files: [{ id: 'h1f', filename: 'a.png', bytes: new Uint8Array(PNG), declaredBytes: PNG.length }] }],
+    });
+    // The header commits, then the file fails transiently (W1's 503).
+    fx.source.failures.file.set('file:h1f', [new SourceUnavailableError('timeout')]);
+    const window = await openWindow(fx);
+    await drive(fx, (await startImportRun(fx, 'import', window.id)).id);
+    const [begun] = await importedTickets(fx);
+    expect(begun).toBeDefined();
+    expect((await ledger(fx.sourceId)).get('h1')).toMatchObject({ state: 'failed', failureCode: 'attachment_unavailable', breezeTicketId: begun!.id, importedVersion: null });
+
+    // A technician hard-deletes the partial ticket; the next run must not recreate it.
+    await withSystemDbAccessContext(() => db.delete(tickets).where(eq(tickets.id, begun!.id)));
+    fx.source.calls.load = [];
+    const next = await startImportRun(fx, 'import', window.id);
+    await drive(fx, next.id);
+    expect(fx.source.calls.load).toEqual([]);
+    expect((await ledger(fx.sourceId)).get('h1')).toMatchObject({ state: 'removed_in_breeze', breezeTicketId: begun!.id });
+    expect(await importedTickets(fx)).toEqual([]);
+    expect((await issuesOf(next.id)).map((i) => i.kind)).toEqual(['removed_in_breeze']);
+  }, CASE_TIMEOUT);
+
+  runDb('a run that stops mid-ticket records the ticket it began before stopping (review #2)', async () => {
+    const fx = await seedImport();
+    fx.source.tickets = fakeTickets(['s1'], {
+      comments: [{ id: 's1-1', at: minutes(5), content: 'With a file', files: [{ id: 's1f', filename: 'a.png', bytes: new Uint8Array(PNG), declaredBytes: PNG.length }] }],
+    });
+    const window = await openWindow(fx);
+    // The window closes while the file downloads: after the header committed.
+    const closing: typeof importTicket = (windowId, ticket, options) => importTicket(windowId, ticket, {
+      ...options,
+      fetchAttachment: async (id, max) => {
+        await closeWindow(fx, windowId);
+        return options.fetchAttachment!(id, max);
+      },
+    });
+    const run = await startImportRun(fx, 'import', window.id);
+    await drive(fx, run.id, { deps: { sliceDeps: { importTicket: closing } } });
+    expect(await runRow(run.id)).toMatchObject({ state: 'stopped', stopReason: 'window_closed' });
+    const [begun] = await importedTickets(fx);
+    expect((await ledger(fx.sourceId)).get('s1')).toMatchObject({ breezeTicketId: begun!.id, state: 'failed', failureCode: 'incomplete' });
+
+    await withSystemDbAccessContext(() => db.delete(tickets).where(eq(tickets.id, begun!.id)));
+    const reopened = await openWindow(fx);
+    await drive(fx, (await startImportRun(fx, 'import', reopened.id)).id);
+    expect((await ledger(fx.sourceId)).get('s1')).toMatchObject({ state: 'removed_in_breeze' });
+    expect(await importedTickets(fx)).toEqual([]);
   }, CASE_TIMEOUT);
 
   runDb('MIGRATION_SOURCE_ID_IN_USE fails the item with its reason; the run goes on', async () => {

@@ -202,6 +202,8 @@ export const ticketImportItems = pgTable('ticket_import_items', {
   importedVersion: varchar('imported_version', { length: 64 }),
   seenVersion: varchar('seen_version', { length: 64 }),
   seenRunId: uuid('seen_run_id'),
+  // FK-less: the Breeze ticket this item imported into, or began to.
+  breezeTicketId: uuid('breeze_ticket_id'),
   failureCode: varchar('failure_code', { length: 64 }),
   // Failed attempts since the last success.
   attempts: integer('attempts').notNull().default(0),
