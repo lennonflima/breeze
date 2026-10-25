@@ -141,6 +141,12 @@ CREATE TABLE IF NOT EXISTS ticket_import_items (
   imported_version varchar(64),
   seen_version varchar(64),
   seen_run_id uuid,
+  -- The Breeze ticket this item imported into, or began to (a header written
+  -- before a later transaction failed). FK-less: tickets are org data, and an
+  -- erased org or a hard delete leaves the id behind, which is the point: an
+  -- item that ever had a ticket is never imported again once its ref is gone
+  -- (removed_in_breeze, spec §5.9).
+  breeze_ticket_id uuid,
   failure_code varchar(64),
   attempts integer NOT NULL DEFAULT 0,
   updated_at timestamptz NOT NULL DEFAULT now(),
