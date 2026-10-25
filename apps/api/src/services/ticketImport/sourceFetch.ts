@@ -1,4 +1,5 @@
 import { selfHostAllowsPrivateNetwork } from '../../config/env';
+import { Semaphore } from '../../utils/semaphore';
 import { checkSsrfSafe, type SsrfMode } from '../ssrfGuard';
 import { ResponseTooLargeError, safeFetch, SsrfBlockedError } from '../urlSafety';
 
@@ -161,23 +162,6 @@ export function clockSkewFromDateHeader(headers: Headers, now: number = Date.now
   if (!date) return null;
   const at = Date.parse(date);
   return Number.isFinite(at) ? at - now : null;
-}
-
-class Semaphore {
-  private active = 0;
-  private readonly waiting: Array<() => void> = [];
-  constructor(private readonly limit: number) {}
-
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.active >= this.limit) await new Promise<void>((resolve) => this.waiting.push(resolve));
-    this.active += 1;
-    try {
-      return await fn();
-    } finally {
-      this.active -= 1;
-      this.waiting.shift()?.();
-    }
-  }
 }
 
 const defaultBackoff = (attempt: number) => 1000 * 3 ** (attempt - 1);
