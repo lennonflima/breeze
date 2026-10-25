@@ -8,6 +8,7 @@ import {
   ticketImportRunIssues,
   ticketImportRuns,
   TICKET_IMPORT_ACTIVE_RUN_STATES,
+  type PendingLink,
   type TicketImportItemState,
   type TicketImportRunKind,
   type TicketImportRunPhase,
@@ -113,6 +114,8 @@ export type ItemRow = {
   seenRunId: string | null;
   /** The Breeze ticket this item imported into, or began to (FK-less). */
   breezeTicketId: string | null;
+  /** Links waiting for the links phase; null when none wait. */
+  pendingLinks: PendingLink[] | null;
   failureCode: string | null;
   attempts: number;
 };
@@ -127,6 +130,7 @@ const itemColumns = {
   seenVersion: ticketImportItems.seenVersion,
   seenRunId: ticketImportItems.seenRunId,
   breezeTicketId: ticketImportItems.breezeTicketId,
+  pendingLinks: ticketImportItems.pendingLinks,
   failureCode: ticketImportItems.failureCode,
   attempts: ticketImportItems.attempts,
 };
@@ -205,6 +209,8 @@ export type SliceCommit = {
   counters: Record<string, unknown>;
   items?: readonly ItemWrite[];
   issues?: readonly RunIssue[];
+  /** owner_unmatched rows, deduplicated per run by ticket_import_run_issues_owner_uq. */
+  ownerIssues?: readonly RunIssue[];
   /** Hand the run to slice seq + 1 (the compare-and-set of §5.8). */
   advance?: boolean;
   finish?: { state: Extract<TicketImportRunState, 'completed' | 'stopped' | 'failed'>; stopReason: string | null };
@@ -218,14 +224,43 @@ export type SliceCommit = {
  * `runContext`). The run's UPDATE goes first and is the gate: it matches only
  * while this slice owns a running run.
  */
-export async function commitSlice(partnerId: string, runId: string, seq: number, token: string, commit: SliceCommit): Promise<void> {
+export async function commitSlice(
+  partnerId: string,
+  runId: string,
+  seq: number,
+  token: string,
+  commit: SliceCommit,
+): Promise<{ ownersInserted: number }> {
   const now = new Date();
+  // Distinct owners first, so the counters the gate writes include them; a
+  // refused gate rolls these rows back with everything else.
+  let ownersInserted = 0;
+  const owners = commit.ownerIssues ?? [];
+  for (let i = 0; i < owners.length; i += 500) {
+    const inserted = await db
+      .insert(ticketImportRunIssues)
+      .values(owners.slice(i, i + 500).map((issue) => ({
+        runId,
+        partnerId,
+        sourceTicketKey: issue.sourceTicketKey,
+        sourceTicketNumber: issue.sourceTicketNumber,
+        kind: issue.kind,
+        code: issue.code,
+        count: issue.count,
+      })))
+      .onConflictDoNothing()
+      .returning({ id: ticketImportRunIssues.id });
+    ownersInserted += inserted.length;
+  }
+  const counters = ownersInserted > 0
+    ? { ...commit.counters, ownersUnmatched: (Number(commit.counters.ownersUnmatched) || 0) + ownersInserted }
+    : commit.counters;
   const updated = await db
     .update(ticketImportRuns)
     .set({
       phase: commit.phase,
       cursor: commit.cursor,
-      counters: commit.counters,
+      counters,
       heartbeatAt: now,
       resumeAt: commit.resumeAt ?? null,
       ...(commit.advance ? { sliceSeq: seq + 1, sliceToken: null } : {}),
@@ -256,6 +291,7 @@ export async function commitSlice(partnerId: string, runId: string, seq: number,
           seenVersion: sql`excluded.seen_version`,
           seenRunId: sql`excluded.seen_run_id`,
           breezeTicketId: sql`excluded.breeze_ticket_id`,
+          pendingLinks: sql`excluded.pending_links`,
           failureCode: sql`excluded.failure_code`,
           attempts: sql`excluded.attempts`,
           updatedAt: sql`excluded.updated_at`,
@@ -274,6 +310,22 @@ export async function commitSlice(partnerId: string, runId: string, seq: number,
       count: issue.count,
     })));
   }
+  return { ownersInserted };
+}
+
+/** Items with links waiting for the links phase, in key order after `after`. */
+export async function readItemsWithPendingLinks(partnerId: string, sourceId: string, after: string | null, limit: number): Promise<ItemRow[]> {
+  return db
+    .select(itemColumns)
+    .from(ticketImportItems)
+    .where(and(
+      eq(ticketImportItems.sourceId, sourceId),
+      eq(ticketImportItems.partnerId, partnerId),
+      sql`${ticketImportItems.pendingLinks} IS NOT NULL`,
+      after === null ? undefined : gt(ticketImportItems.sourceTicketKey, after),
+    ))
+    .orderBy(asc(ticketImportItems.sourceTicketKey))
+    .limit(limit);
 }
 
 /**

@@ -153,6 +153,9 @@ CREATE TABLE IF NOT EXISTS ticket_import_items (
   -- item that ever had a ticket is never imported again once its ref is gone
   -- (removed_in_breeze, spec §5.9).
   breeze_ticket_id uuid,
+  -- Links the conversion asked for, waiting for the links phase (spec §6.6);
+  -- NULL when none wait. Source keys, link types and times only.
+  pending_links jsonb,
   failure_code varchar(64),
   attempts integer NOT NULL DEFAULT 0,
   updated_at timestamptz NOT NULL DEFAULT now(),
@@ -185,6 +188,10 @@ CREATE TABLE IF NOT EXISTS ticket_import_run_issues (
 );
 
 CREATE INDEX IF NOT EXISTS ticket_import_run_issues_run_idx ON ticket_import_run_issues (run_id, kind, created_at, id);
+-- One owner_unmatched row per distinct source owner per run (its code is the
+-- source user key): the dedupe the run used to keep in its cursor.
+CREATE UNIQUE INDEX IF NOT EXISTS ticket_import_run_issues_owner_uq
+  ON ticket_import_run_issues (run_id, code) WHERE kind = 'owner_unmatched';
 CREATE INDEX IF NOT EXISTS ticket_import_run_issues_partner_idx ON ticket_import_run_issues (partner_id);
 
 DO $$

@@ -1,5 +1,5 @@
 import { withDbAccessContext } from '../../db';
-import type { TicketImportRunPhase } from '../../db/schema';
+import type { PendingLink, TicketImportRunPhase } from '../../db/schema';
 import { createAuditLogAsync } from '../auditService';
 import { captureException } from '../sentry';
 import { MigrationWindowError } from '../migrationWindows';
@@ -15,6 +15,7 @@ import {
   commitSlice,
   loadRun,
   readItems,
+  readItemsWithPendingLinks,
   readSourceMaps,
   readUnseenImported,
   runContext,
@@ -36,7 +37,7 @@ import {
   recordImportResult,
   type IssueTarget,
 } from './runOutcomes';
-import { IssueBuffer, normalizeCounters, type RunCounters } from './runReport';
+import { IssueBuffer, normalizeCounters, type RunCounters, type RunIssue } from './runReport';
 import { openSourceCredentials } from './sourceCredentials';
 import { SourceAuthError, SourceHttpError, SourceResponseTooLargeError, SourceUnavailableError, type SourceClient } from './sourceFetch';
 import { buildSourceHandle } from './sourceHandle';
@@ -109,6 +110,7 @@ type EndStep = Exclude<Step, { kind: 'progress' }>;
 type RowResult = { kind: 'done'; slow: boolean } | Exclude<Step, { kind: 'progress' } | { kind: 'yield' }>;
 
 const DELETIONS_BATCH = 50;
+const LINKS_BATCH = 50;
 const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
 
 function sourceBackoffMs(failures: number): number {
@@ -142,6 +144,8 @@ class SliceRunner {
   private readonly dryRun: boolean;
   private phase: TicketImportRunPhase;
   private pending: ItemWrite[] = [];
+  /** owner_unmatched rows for the next commit (deduplicated there, review #13). */
+  private ownerIssues: RunIssue[] = [];
   private progressed = false;
   /**
    * Set by the attachment reader when a file's failure means more than that
@@ -264,15 +268,19 @@ class SliceRunner {
   private async commit(extra: { advance?: boolean; finish?: { state: 'completed' | 'stopped' | 'failed'; stopReason: string | null }; resumeAt?: Date } = {}): Promise<void> {
     const items = this.pending;
     this.pending = [];
-    await withDbAccessContext(runContext(this.input.partnerId), () => commitSlice(this.input.partnerId, this.input.runId, this.input.seq, this.claimToken, {
+    const ownerIssues = this.ownerIssues;
+    this.ownerIssues = [];
+    const result = await withDbAccessContext(runContext(this.input.partnerId), () => commitSlice(this.input.partnerId, this.input.runId, this.input.seq, this.claimToken, {
       sourceId: this.run.sourceId,
       phase: this.phase,
       cursor: this.cursor as unknown as Record<string, unknown>,
       counters: this.counters as unknown as Record<string, unknown>,
       items,
       issues: this.issues.take(),
+      ownerIssues,
       ...extra,
     }));
+    this.counters.ownersUnmatched += result.ownersInserted;
   }
 
   private async end(step: EndStep): Promise<SliceOutcome> {
@@ -338,7 +346,7 @@ class SliceRunner {
     this.progressed = true;
     this.cursor.scan = { page: page.next, index: 0, done: page.next === null };
     if (this.cursor.scan.done) {
-      this.phase = this.dryRun ? 'done' : this.cursor.links.queue.length > 0 && this.deps.linkWriter ? 'links' : 'deletions';
+      this.phase = this.dryRun ? 'done' : this.deps.linkWriter ? 'links' : 'deletions';
     }
     await this.commit();
     return { kind: 'progress' };
@@ -409,6 +417,7 @@ class SliceRunner {
       seenVersion: row.version.slice(0, 64),
       seenRunId: this.input.runId,
       breezeTicketId: item?.breezeTicketId ?? null,
+      pendingLinks: item?.pendingLinks ?? null,
       failureCode: null,
       attempts: item?.attempts ?? 0,
       ...change,
@@ -432,6 +441,7 @@ class SliceRunner {
         failureCode: 'incomplete',
         attempts: 0,
         breezeTicketId: null,
+        pendingLinks: null,
       }),
       breezeTicketId: ticketId,
     });
@@ -475,7 +485,7 @@ class SliceRunner {
     }
     // A conversion must import the ticket its row names (§5.2 ids).
     if (conversionIdentityViolation(conversion, row.key)) return this.failItem(row, item, target, 'module_contract_violation');
-    applyNotes(conversion.notes, this.counters, this.issues, this.cursor, target);
+    applyNotes(conversion.notes, this.counters, this.issues, this.ownerIssues, target);
     if (conversion.kind === 'skip') {
       this.counters.tickets.skipped += 1;
       this.issues.add({
@@ -541,17 +551,17 @@ class SliceRunner {
     // A ticket with links records its version once they are written or known
     // impossible (§6.6); with no link writer they stay the conversion's note.
     let importedVersion: string | null = row.version.slice(0, 64);
+    let pendingLinks: PendingLink[] | null = null;
     if (conversion.links.length > 0) {
       if (this.deps.linkWriter) {
-        for (const link of conversion.links) {
-          this.cursor.links.queue.push({ ...link, at: link.at.toISOString(), sourceVersion: importedVersion });
-        }
+        // They wait on the item for the links phase (review #13).
+        pendingLinks = conversion.links.map((l) => ({ targetKey: l.targetKey, linkType: l.linkType, at: l.at.toISOString() }));
         importedVersion = item?.importedVersion ?? null;
       } else {
         this.counters.linksAsNotes += conversion.links.length;
       }
     }
-    this.stage(this.itemOf(row, item, { state: 'imported', importedVersion, attempts: 0, breezeTicketId: result.ticketId }));
+    this.stage(this.itemOf(row, item, { state: 'imported', importedVersion, pendingLinks, attempts: 0, breezeTicketId: result.ticketId }));
     return { kind: 'done', slow: true };
   }
 
@@ -690,39 +700,48 @@ class SliceRunner {
 
   private async linksStep(): Promise<Step> {
     const writer = this.deps.linkWriter;
-    const queue = this.cursor.links.queue;
-    while (writer && this.cursor.links.index < queue.length) {
+    if (!writer) {
+      this.phase = 'deletions';
+      return { kind: 'progress' };
+    }
+    const batch = await withDbAccessContext(runContext(this.input.partnerId), () =>
+      readItemsWithPendingLinks(this.input.partnerId, this.run.sourceId, this.cursor.links.after, LINKS_BATCH));
+    if (batch.length === 0) {
+      this.phase = 'deletions';
+      await this.commit();
+      return { kind: 'progress' };
+    }
+    for (const item of batch) {
       if (this.timeUp()) return { kind: 'yield' };
-      const link = queue[this.cursor.links.index]!;
-      let result: Awaited<ReturnType<ImportLinkWriter['writeLink']>>;
-      try {
-        result = await writer.writeLink(this.window!.id, { ...link, at: new Date(link.at) }, { partnerId: this.input.partnerId });
-      } catch (error) {
-        if (isInfrastructureError(error)) throw error;
-        this.reportTicketFault(error, link.sourceKey, 'link');
-        result = { outcome: 'not_written', code: 'internal_error', retry: true };
-      }
-      const done = result.outcome !== 'not_written' || result.retry !== true;
-      if (result.outcome === 'not_written') {
-        this.counters.linksAsNotes += 1;
-        this.issues.add({ sourceTicketKey: link.sourceKey, sourceTicketNumber: null, kind: 'link_not_written', code: result.code ?? null });
-      } else {
-        this.counters.linksWritten += 1;
-      }
-      if (done) {
-        const items = await withDbAccessContext(runContext(this.input.partnerId), () =>
-          readItems(this.input.partnerId, this.run.sourceId, [link.sourceKey]));
-        const item = items.get(link.sourceKey);
-        if (item && item.state === 'imported' && item.seenVersion === link.sourceVersion) {
-          this.stage({ ...item, importedVersion: link.sourceVersion });
+      // Final for this version once every link is written, or known impossible
+      // (§6.6); a link worth another try leaves the item to be reloaded.
+      let final = true;
+      for (const link of item.pendingLinks ?? []) {
+        let result: Awaited<ReturnType<ImportLinkWriter['writeLink']>>;
+        try {
+          result = await writer.writeLink(
+            this.window!.id,
+            { sourceKey: item.sourceTicketKey, targetKey: link.targetKey, linkType: link.linkType, at: new Date(link.at) },
+            { partnerId: this.input.partnerId },
+          );
+        } catch (error) {
+          if (isInfrastructureError(error)) throw error;
+          this.reportTicketFault(error, item.sourceTicketKey, 'link');
+          result = { outcome: 'not_written', code: 'internal_error', retry: true };
+        }
+        if (result.outcome === 'not_written') {
+          this.counters.linksAsNotes += 1;
+          this.issues.add({ sourceTicketKey: item.sourceTicketKey, sourceTicketNumber: null, kind: 'link_not_written', code: result.code ?? null });
+          if (result.retry === true) final = false;
+        } else {
+          this.counters.linksWritten += 1;
         }
       }
-      this.cursor.links.index += 1;
+      this.stage({ ...item, pendingLinks: null, importedVersion: final ? item.seenVersion : item.importedVersion });
+      this.cursor.links.after = item.sourceTicketKey;
       await this.commit();
       this.progressed = true;
     }
-    this.phase = 'deletions';
-    await this.commit();
     return { kind: 'progress' };
   }
 
